@@ -1,0 +1,28 @@
+[package]
+name = "gitcog"
+version = "0.1.0"
+edition = "2021"
+authors = ["CHERRAD Charef <ccherrad@gmail.com>"]
+description = "Cognitive debt detection and management for Git repositories — audit, endorse, and surface AI-attributed risk"
+repository = "https://github.com/ccherrad/git-cognitive"
+license = "MIT OR Apache-2.0"
+keywords = ["git", "cognitive-debt", "ai-attribution", "endorsement", "code-review"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".git/",
+    ".gitignore",
+    "target/",
+]
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "=4.5.23", features = ["derive"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+crossterm = "0.28"
+indicatif = "0.17"
+
+[[bin]]
+name = "git-cognitive"
+path = "src/main.rs"
