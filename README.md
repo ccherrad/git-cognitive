@@ -3,8 +3,8 @@
 Cognitive debt detection and management for Git repositories.
 Zero LLM. Zero network. All signals from git.
 
-[![Crates.io](https://img.shields.io/crates/v/gitcog)](https://crates.io/crates/gitcog)
-[![License](https://img.shields.io/crates/l/gitcog)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/git-cognitive)](https://crates.io/crates/git-cognitive)
+[![License](https://img.shields.io/crates/l/git-cognitive)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org)
 
 ## The problem
@@ -50,7 +50,7 @@ Checked in priority order:
 ## Install
 
 ```sh
-cargo install gitcog
+cargo install git-cognitive
 ```
 
 Or from source:
