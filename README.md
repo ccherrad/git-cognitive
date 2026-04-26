@@ -13,15 +13,39 @@ AI coding agents ship code fast. Humans lose track of what was AI-generated and 
 
 ## How it works
 
-Storage: `cognitive-debt/v1` orphan branch (sharded JSON). Local cache: `.git/cognitive.db` (SQLite, read-only index). No external services.
+Every `git commit` automatically:
+1. Slices the active Claude Code session to the window between this commit and the previous one
+2. Attributes AI lines by matching agent Write/Edit tool calls against the commit diff
+3. Scores friction via tree-sitter AST analysis (complexity delta, doc gap, author churn)
+4. Classifies the commit and writes to the `cognitive-debt/v1` orphan branch
 
-Three signals feed the friction score (0.0–1.0):
+Each commit gets three files stored in a sharded orphan branch:
 
-- **Complexity delta** (0.4 weight) — conditional branches added/removed in diff
-- **Doc gap** (0.4 weight) — ratio of comment lines to logic lines in diff
-- **Author churn** (0.2 weight) — distinct committers on changed files in last 90 days
+```
+cognitive-debt/v1
+└── ab/cd/ef1234/
+    ├── activity.json     — classification, friction score, AI attribution, endorsement status
+    ├── endorsements.json — who endorsed it and when
+    └── session.jsonl     — the Claude conversation that produced this commit
+```
 
-AI attribution: reads `Agent-Attribution: 80%` trailer from commit message, falls back to `Co-Authored-By: Claude` keyword heuristic, or parses Claude Code JSONL transcripts for line-level accuracy.
+No external service. No daemon. Everything in git.
+
+## Friction score
+
+Three signals, weighted sum (0.0–1.0):
+
+- **Complexity delta (0.4)** — real decision points added (`if`, `match arm`, `&&`, `||`, etc.) parsed via tree-sitter AST
+- **Doc gap (0.4)** — functions added without a doc comment node in the AST
+- **Author churn (0.2)** — distinct committers on changed files in the last 90 days
+
+## AI attribution
+
+Checked in priority order:
+
+1. `Agent-Attribution: 75%` trailer in the commit message — exact percentage
+2. Line-level matching — agent Write/Edit lines vs git diff lines, per file
+3. Keyword scan — `Co-Authored-By: Claude`, `co-authored-by: copilot`, `cursor`, `ai-generated`
 
 ## Install
 
@@ -40,26 +64,28 @@ cargo install --path .
 ## Quickstart
 
 ```sh
-# 1. Set up automatic auditing on every commit
-git-cognitive install
+# 1. Enable automatic auditing on every commit
+git-cognitive enable claude
 
-# 2. Audit the last commit manually
-git-cognitive audit --commit HEAD
-
-# 3. See the heatmap
+# 2. See the debt
 git-cognitive debt
 
-# 4. Endorse commits interactively
+# 3. Endorse commits interactively
 git-cognitive endorse
 
-# 5. Check who knows what
-git-cognitive debt --who
-
-# 6. Inspect a specific commit
-git-cognitive show HEAD
+# 4. Share with your team
+git-cognitive push
 ```
 
 ## Commands
+
+### `enable`
+
+```
+git-cognitive enable claude
+```
+
+Writes `.git/hooks/post-commit` to auto-audit and push on every commit.
 
 ### `audit`
 
@@ -67,31 +93,29 @@ git-cognitive show HEAD
 git-cognitive audit [--commit <SHA>|HEAD] [--since <SHA>] [--all] [--check-zombies]
 ```
 
-Walks commits and writes activity items to `cognitive-debt/v1`. Tracks:
+Walks commits and writes activity to `cognitive-debt/v1`. Run manually to backfill history.
 
-- Classification: `new_feature`, `bug_fix`, `refactor`, `tech_debt`, `risk`, `minor`, `dependency_update`, `subsystem_change`
-- AI-free zone enforcement: paths matching `auth/`, `payments/`, `migrations/`, `.sql` are forced to `risk` regardless of commit message
-- Friction score (0.0–1.0)
-- AI attribution (from commit trailers or keyword heuristics)
-
-### `endorse`
-
-```
-git-cognitive endorse [HEAD|<SHA>] [--status reviewed|endorsed]
-git-cognitive endorse          # interactive TUI picker
-```
-
-Records endorsement on the `cognitive-debt/v1` branch and pushes automatically. Interactive picker: ↑↓/jk navigate, `e`/Enter endorse, `r` reviewed, `s` git show, `q` quit.
+- `--all` — backfill last 500 commits
+- `--check-zombies` — flag AI commits unendorsed >30 days with no human follow-up
 
 ### `debt`
 
 ```
-git-cognitive debt [--subsystem <name>] [--interactive] [--who]
+git-cognitive debt [--interactive]
 ```
 
-- Default: heatmap table — subsystems × items × endorsed × friction × zombies
-- `--interactive`: opens TUI picker filtered to all non-excluded items
-- `--who`: bus factor table — who endorsed what per subsystem, color-coded (red = 0, yellow = 1, green = 2+)
+Flat table of all commits: SHA, classification, friction score, AI%, title, endorsement status.
+
+### `endorse`
+
+```
+git-cognitive endorse [<SHA>|HEAD]
+git-cognitive endorse          # interactive TUI picker
+```
+
+Mark a commit as understood and vouched for. Pushes automatically.
+
+TUI controls: `↑↓`/`jk` navigate, `e`/Enter endorse, `s` git show, `q` quit.
 
 ### `show`
 
@@ -99,69 +123,70 @@ git-cognitive debt [--subsystem <name>] [--interactive] [--who]
 git-cognitive show <SHA>|HEAD
 ```
 
-Displays full activity item + complete endorsement history for a commit.
+Full activity item + endorsement history for a commit.
 
 ### `session`
 
 ```
-git-cognitive session capture [--session-id <UUID>]
+git-cognitive session <SHA>|HEAD
 ```
 
-Parses a Claude Code JSONL transcript (`~/.claude/projects/<project>/<id>.jsonl`) to compute line-level AI attribution per commit. Called automatically by the Stop hook when using `git-cognitive install`.
+Shows the Claude conversation (prompts, responses, tool calls) captured for this commit's window.
 
-### `install`
-
-```
-git-cognitive install
-```
-
-Writes `.git/hooks/post-commit` to auto-audit on every commit. Prints instructions for adding the Stop hook to `~/.claude/settings.json` for automatic session capture.
-
-## Storage model
+### `push` / `pull`
 
 ```
-cognitive-debt/v1 (orphan branch)
-└── <ab>/<cd>/<ef1234>/
-    ├── activity.json      — classification, friction, AI attribution, endorsement status
-    ├── endorsements.json  — ordered list of endorsement events with author + timestamp
-    └── session.json       — Claude Code session transcript (if captured)
+git-cognitive push
+git-cognitive pull
 ```
 
-Sharding: first 6 hex chars of SHA split as `ab/cd/ef` — same layout as `entireio/cli`.
+Share cognitive debt data with your team via the `cognitive-debt/v1` branch.
 
-Teams share cognitive debt data by pushing/fetching the `cognitive-debt/v1` branch:
+## Classifications
 
-```sh
-git push origin cognitive-debt/v1
-git fetch origin cognitive-debt/v1:cognitive-debt/v1
-```
-
-## AI-free zones
-
-Files matching these patterns are always classified as `risk`, regardless of commit message:
-
-```
-auth/, authentication/, authorization/
-payments/, payment/, billing/
-migrations/, migration/, schema, .sql
-```
+| Class | Trigger |
+|---|---|
+| `risk` | AI ≥70% + feat, or files in `auth/`, `payments/`, `migrations/`, `.sql` |
+| `tech_debt` | AI ≥70% + refactor/chore |
+| `new_feature` | `feat:`, `add:`, `new:` + low AI |
+| `bug_fix` | `fix:`, `bug:` |
+| `refactor` | `refactor:`, `chore:` + low AI |
+| `dependency_update` | `Cargo.lock`, `yarn.lock`, etc. — auto-excluded from endorsement queue |
+| `minor` | `docs:`, `test:`, `ci:`, `style:` — auto-excluded |
+| `other` | anything else |
 
 ## Zombie detection
 
 A zombie is an AI-attributed commit that:
-1. Has been unendorsed for > 30 days
+1. Has been unendorsed for >30 days
 2. Has had no human follow-up commit touching the same files
 
-Run: `git-cognitive audit --check-zombies`
+```sh
+git-cognitive audit --check-zombies
+```
 
 ## Agent-Attribution trailer
 
-Add to commit messages for precise attribution without parsing transcripts:
+Add to commit messages for precise attribution without relying on line matching:
 
 ```
-feat: add user authentication flow
+feat: add payment processing flow
 
-Agent-Attribution: 75%
+Agent-Attribution: 80%
+```
+
+## Team workflow
+
+```sh
+# morning
+git-cognitive pull
+git-cognitive debt
+
+# review queue
+git-cognitive endorse
+
+# weekly
+git-cognitive audit --check-zombies
 ```
 
 ## See also

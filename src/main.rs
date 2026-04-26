@@ -3,6 +3,7 @@ mod cognitive_debt;
 mod db;
 mod picker;
 mod session;
+mod treesitter;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -36,32 +37,16 @@ enum Commands {
         check_zombies: bool,
     },
 
-    #[command(about = "Endorse an activity item as reviewed or understood")]
+    #[command(about = "Endorse a commit as understood and vouched for")]
     Endorse {
         #[arg(help = "Commit SHA or HEAD (omit for interactive picker)")]
         sha: Option<String>,
-
-        #[arg(
-            long,
-            default_value = "endorsed",
-            help = "Endorsement status: reviewed | endorsed"
-        )]
-        status: String,
     },
 
-    #[command(about = "Show cognitive debt heatmap by subsystem")]
+    #[command(about = "Show cognitive debt — flat list of commits with friction and status")]
     Debt {
-        #[arg(long, help = "Filter by subsystem name")]
-        subsystem: Option<String>,
-
         #[arg(long, help = "Open interactive picker to endorse items")]
         interactive: bool,
-
-        #[arg(
-            long,
-            help = "Show knowledge concentration (who endorsed what per subsystem)"
-        )]
-        who: bool,
     },
 
     #[command(about = "Show activity item details and endorsement history for a commit")]
@@ -70,28 +55,22 @@ enum Commands {
         sha: String,
     },
 
-    #[command(about = "Capture Claude Code session for AI attribution")]
+    #[command(about = "Show the session slice captured for a commit")]
     Session {
-        #[command(subcommand)]
-        action: SessionAction,
+        #[arg(help = "Commit SHA or HEAD")]
+        sha: String,
     },
+
+    #[command(about = "Push cognitive debt data to origin")]
+    Push,
+
+    #[command(about = "Pull cognitive debt data from origin")]
+    Pull,
 
     #[command(about = "Enable a coding agent for this project (e.g. claude)")]
     Enable {
         #[arg(help = "Agent to enable: claude")]
         agent: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum SessionAction {
-    #[command(about = "Capture a specific session by ID (omit for latest)")]
-    Capture {
-        #[arg(
-            long,
-            help = "Session ID (UUID from ~/.claude/projects/<project>/<id>.jsonl)"
-        )]
-        session_id: Option<String>,
     },
 }
 
@@ -118,35 +97,27 @@ fn main() -> Result<()> {
                 check_zombies,
             )?;
         }
-        Commands::Endorse { sha, status } => {
-            endorse_command(sha.as_deref(), &status)?;
+        Commands::Endorse { sha } => {
+            endorse_command(sha.as_deref())?;
         }
-        Commands::Debt {
-            subsystem,
-            interactive,
-            who,
-        } => {
+        Commands::Debt { interactive } => {
             if interactive {
-                debt_interactive(subsystem.as_deref())?;
-            } else if who {
-                debt_who_command(subsystem.as_deref())?;
+                debt_interactive()?;
             } else {
-                debt_command(subsystem.as_deref())?;
+                debt_command()?;
             }
         }
         Commands::Show { sha } => {
             let resolved = resolve_sha(&sha)?;
             show_command(&resolved)?;
         }
-        Commands::Session { action } => {
+        Commands::Session { sha } => {
             let repo_path = PathBuf::from(".");
-            match action {
-                SessionAction::Capture { session_id } => match session_id {
-                    Some(id) => session::run_session_capture(&repo_path, &id)?,
-                    None => session::run_session_capture_latest(&repo_path)?,
-                },
-            }
+            let resolved = resolve_sha(&sha)?;
+            session::run_show_session(&repo_path, &resolved)?;
         }
+        Commands::Push => sync_push()?,
+        Commands::Pull => sync_pull()?,
         Commands::Enable { agent } => match agent.as_str() {
             "claude" => enable_claude()?,
             other => anyhow::bail!("Unknown agent '{}'. Supported: claude", other),
@@ -168,14 +139,8 @@ fn resolve_sha(sha: &str) -> Result<String> {
     }
 }
 
-fn do_endorse(sha: &str, status_str: &str) -> Result<()> {
+fn do_endorse(sha: &str) -> Result<()> {
     use cognitive_debt::{DebtStore, EndorsementRecord, EndorsementStatus};
-
-    let status = match status_str {
-        "reviewed" => EndorsementStatus::Reviewed,
-        "endorsed" => EndorsementStatus::Endorsed,
-        other => anyhow::bail!("Unknown status '{}'. Use: reviewed | endorsed", other),
-    };
 
     let author = std::process::Command::new("git")
         .args(["config", "user.email"])
@@ -187,7 +152,7 @@ fn do_endorse(sha: &str, status_str: &str) -> Result<()> {
     let store = DebtStore::open(&repo_path)?;
     let record = EndorsementRecord {
         sha: sha.to_string(),
-        status,
+        status: EndorsementStatus::Endorsed,
         author,
         timestamp: cognitive_debt::now_rfc3339(),
     };
@@ -196,21 +161,17 @@ fn do_endorse(sha: &str, status_str: &str) -> Result<()> {
     let db = db::Database::init()?;
     db.insert_endorsement(&record)?;
     store.commit()?;
+    sync_push().ok();
 
-    std::process::Command::new("git")
-        .args(["push", "origin", "cognitive-debt/v1"])
-        .output()
-        .ok();
-
-    println!("Endorsed {} as '{}'.", &sha[..8.min(sha.len())], status_str);
+    println!("Endorsed {}.", &sha[..8.min(sha.len())]);
     Ok(())
 }
 
-fn endorse_command(sha: Option<&str>, status_str: &str) -> Result<()> {
+fn endorse_command(sha: Option<&str>) -> Result<()> {
     match sha {
         Some(s) => {
             let resolved = resolve_sha(s)?;
-            do_endorse(&resolved, status_str)
+            do_endorse(&resolved)
         }
         None => {
             loop {
@@ -225,14 +186,7 @@ fn endorse_command(sha: Option<&str>, status_str: &str) -> Result<()> {
 
                 match picker::run_picker(picker_items)? {
                     None => break,
-                    Some(result) => {
-                        let (sha, status) = if let Some(rest) = result.strip_prefix("reviewed:") {
-                            (rest.to_string(), "reviewed")
-                        } else {
-                            (result, status_str)
-                        };
-                        do_endorse(&sha, status)?;
-                    }
+                    Some(sha) => do_endorse(&sha)?,
                 }
             }
             Ok(())
@@ -264,7 +218,6 @@ fn show_command(sha: &str) -> Result<()> {
             }
             println!();
             println!("  class    {}", item.classification);
-            println!("  subsys   {}", item.subsystem);
             println!("  friction {:.2}", item.cognitive_friction_score);
             if let Some(pct) = item.attribution_pct {
                 println!("  agent    {:.0}%", pct * 100.0);
@@ -289,110 +242,7 @@ fn show_command(sha: &str) -> Result<()> {
     Ok(())
 }
 
-fn debt_who_command(subsystem_filter: Option<&str>) -> Result<()> {
-    use std::collections::{HashMap, HashSet};
-
-    let db = db::Database::init().context("Failed to initialize database")?;
-    let items = db.all_activity_items()?;
-
-    if items.is_empty() {
-        println!("No activity items. Run `git-cognitive audit` first.");
-        return Ok(());
-    }
-
-    let repo_path = PathBuf::from(".");
-
-    let items: Vec<_> = if let Some(filter) = subsystem_filter {
-        items
-            .into_iter()
-            .filter(|i| i.subsystem == filter)
-            .collect()
-    } else {
-        items
-    };
-
-    let mut subsystem_endorsers: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut subsystem_last: HashMap<String, String> = HashMap::new();
-    let mut subsystem_items: HashMap<String, usize> = HashMap::new();
-
-    for item in &items {
-        *subsystem_items.entry(item.subsystem.clone()).or_insert(0) += 1;
-
-        let endorsements =
-            cognitive_debt::read_endorsements_from_branch(&repo_path, &item.id).unwrap_or_default();
-
-        for e in &endorsements {
-            subsystem_endorsers
-                .entry(item.subsystem.clone())
-                .or_default()
-                .insert(e.author.clone());
-
-            let last = subsystem_last.entry(item.subsystem.clone()).or_default();
-            if e.timestamp > *last {
-                *last = e.timestamp.clone();
-            }
-        }
-    }
-
-    println!(
-        "\n{:<20} {:<7} {:<6} {:<40} LAST ENDORSED",
-        "SUBSYSTEM", "ITEMS", "BUS", "ENDORSERS"
-    );
-    println!("{}", "-".repeat(85));
-
-    let mut subsystems: Vec<&String> = subsystem_items.keys().collect();
-    subsystems.sort();
-
-    for name in subsystems {
-        let items_count = subsystem_items[name];
-        let endorsers = subsystem_endorsers.get(name).cloned().unwrap_or_default();
-        let bus_factor = endorsers.len();
-        let last = subsystem_last
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
-        let last_short = if last.len() > 10 { &last[..10] } else { &last };
-
-        let bus_display = if bus_factor == 0 {
-            format!("\x1B[31m{}\x1B[0m", bus_factor)
-        } else if bus_factor == 1 {
-            format!("\x1B[33m{}\x1B[0m", bus_factor)
-        } else {
-            format!("\x1B[32m{}\x1B[0m", bus_factor)
-        };
-
-        let endorsers_list = if endorsers.is_empty() {
-            "\x1B[31mnone\x1B[0m".to_string()
-        } else {
-            endorsers.into_iter().collect::<Vec<_>>().join(", ")
-        };
-
-        let bus_pad = if bus_display.contains('\x1B') {
-            6 + 9
-        } else {
-            6
-        };
-
-        println!(
-            "{:<20} {:<7} {:<bus_pad$} {:<40} {}",
-            &name[..20.min(name.len())],
-            items_count,
-            bus_display,
-            &endorsers_list[..40.min(endorsers_list.len())],
-            last_short,
-            bus_pad = bus_pad,
-        );
-    }
-
-    println!();
-    println!("BUS = number of distinct people who have endorsed items in this subsystem");
-    println!("\x1B[31m1\x1B[0m = single point of knowledge failure  \x1B[33m2\x1B[0m = at risk  \x1B[32m3+\x1B[0m = healthy");
-    println!();
-
-    Ok(())
-}
-
-fn debt_interactive(subsystem_filter: Option<&str>) -> Result<()> {
+fn debt_interactive() -> Result<()> {
     loop {
         let db = db::Database::init().context("Failed to initialize database")?;
         let items = db.all_activity_items()?;
@@ -402,34 +252,18 @@ fn debt_interactive(subsystem_filter: Option<&str>) -> Result<()> {
             break;
         }
 
-        let items: Vec<_> = if let Some(filter) = subsystem_filter {
-            items
-                .into_iter()
-                .filter(|i| i.subsystem == filter)
-                .collect()
-        } else {
-            items
-        };
-
         let picker_items = picker::build_picker_items(&items, false);
 
         match picker::run_picker(picker_items)? {
             None => break,
-            Some(result) => {
-                let (sha, status) = if let Some(rest) = result.strip_prefix("reviewed:") {
-                    (rest.to_string(), "reviewed")
-                } else {
-                    (result, "endorsed")
-                };
-                do_endorse(&sha, status)?;
-            }
+            Some(sha) => do_endorse(&sha)?,
         }
     }
 
     Ok(())
 }
 
-fn debt_command(subsystem_filter: Option<&str>) -> Result<()> {
+fn debt_command() -> Result<()> {
     use cognitive_debt::{Classification, EndorsementStatus};
 
     let db = db::Database::init().context("Failed to initialize database")?;
@@ -442,127 +276,105 @@ fn debt_command(subsystem_filter: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    let items: Vec<_> = if let Some(filter) = subsystem_filter {
-        items
-            .into_iter()
-            .filter(|i| i.subsystem == filter)
-            .collect()
-    } else {
-        items
-    };
-
-    let mut subsystems: std::collections::HashMap<String, (usize, usize, usize, f32, usize)> =
-        std::collections::HashMap::new();
-
-    for item in &items {
-        if matches!(item.endorsement_status, EndorsementStatus::Excluded) {
-            continue;
-        }
-        let entry = subsystems
-            .entry(item.subsystem.clone())
-            .or_insert((0, 0, 0, 0.0, 0));
-        entry.0 += 1;
-        if matches!(
-            item.endorsement_status,
-            EndorsementStatus::Endorsed | EndorsementStatus::Reviewed
-        ) {
-            entry.1 += 1;
-        } else {
-            entry.2 += 1;
-        }
-        entry.3 += item.cognitive_friction_score;
-        if item.zombie {
-            entry.4 += 1;
-        }
-    }
+    let visible: Vec<_> = items
+        .iter()
+        .filter(|i| !matches!(i.endorsement_status, EndorsementStatus::Excluded))
+        .collect();
 
     println!(
-        "\n{:<20} {:<7} {:<10} {:<12} {:<10} {:<8} STATUS",
-        "SUBSYSTEM", "ITEMS", "ENDORSED", "UNENDORSED", "AVG FRIC", "ZOMBIES"
+        "\n{:<10} {:<12} {:<10} {:<8} {:<59} STATUS",
+        "COMMIT", "CLASS", "FRICTION", "AI", "TITLE"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(105));
 
-    let mut subsystem_list: Vec<_> = subsystems.iter().collect();
-    subsystem_list.sort_by(|a, b| b.1 .2.cmp(&a.1 .2));
-
-    for (name, (total, endorsed, unendorsed, friction_sum, zombies)) in &subsystem_list {
-        let avg_friction = if *total > 0 {
-            friction_sum / *total as f32
+    for item in &visible {
+        let status = if item.zombie {
+            "\x1B[31mZOMBIE\x1B[0m"
         } else {
-            0.0
-        };
-
-        let status = if *zombies > 0 {
-            "\x1B[31m██ ZOMBIE\x1B[0m".to_string()
-        } else if *unendorsed == 0 {
-            "\x1B[32m✓ healthy\x1B[0m".to_string()
-        } else {
-            let pct = *endorsed as f32 / *total as f32;
-            if pct < 0.5 {
-                "\x1B[31m██ CRITICAL\x1B[0m".to_string()
-            } else {
-                "\x1B[33m▓ WARNING\x1B[0m".to_string()
+            match item.endorsement_status {
+                EndorsementStatus::Endorsed => "\x1B[32mendorsed\x1B[0m",
+                _ => "\x1B[31munendorsed\x1B[0m",
             }
         };
 
-        let zombie_str = if *zombies > 0 {
-            format!("\x1B[31m{}\x1B[0m", zombies)
-        } else {
-            "0".to_string()
-        };
+        let ai = item
+            .attribution_pct
+            .map(|p| format!("{:3.0}%", p * 100.0))
+            .unwrap_or_else(|| {
+                if item.ai_attributed {
+                    " ai ".to_string()
+                } else {
+                    "    ".to_string()
+                }
+            });
 
         println!(
-            "{:<20} {:<7} {:<10} {:<12} {:<10} {:<8} {}",
-            &name[..20.min(name.len())],
-            total,
-            endorsed,
-            unendorsed,
-            format!("{:.2}", avg_friction),
-            zombie_str,
+            "{:<10} {:<12} {:<10} {:<8} {:<59} {}",
+            &item.id[..8.min(item.id.len())],
+            &item.classification.to_string()[..12.min(item.classification.to_string().len())],
+            format!("{:.2}", item.cognitive_friction_score),
+            ai,
+            &item.title[..59.min(item.title.len())],
             status,
         );
     }
 
     println!();
 
-    let risk_items: Vec<_> = items
+    let risk_items: Vec<_> = visible
         .iter()
         .filter(|i| {
             matches!(i.classification, Classification::Risk)
-                && !matches!(
-                    i.endorsement_status,
-                    EndorsementStatus::Endorsed | EndorsementStatus::Excluded
-                )
+                && !matches!(i.endorsement_status, EndorsementStatus::Endorsed)
         })
         .collect();
 
     if !risk_items.is_empty() {
         println!("  {} unendorsed RISK item(s):", risk_items.len());
         for item in risk_items.iter().take(5) {
-            println!(
-                "   {} [{}] {}",
-                &item.id[..8.min(item.id.len())],
-                item.subsystem,
-                item.title
-            );
+            println!("   {} {}", &item.id[..8.min(item.id.len())], item.title);
         }
         println!();
     }
 
-    let zombie_items: Vec<_> = items.iter().filter(|i| i.zombie).collect();
+    let zombie_items: Vec<_> = visible.iter().filter(|i| i.zombie).collect();
     if !zombie_items.is_empty() {
         println!("  {} zombie(s) detected:", zombie_items.len());
         for item in zombie_items.iter().take(5) {
-            println!(
-                "   {} [{}] {}",
-                &item.id[..8.min(item.id.len())],
-                item.subsystem,
-                item.title
-            );
+            println!("   {} {}", &item.id[..8.min(item.id.len())], item.title);
         }
         println!();
     }
 
+    Ok(())
+}
+
+fn sync_push() -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["push", "origin", "cognitive-debt/v1"])
+        .output()
+        .context("Failed to run git push")?;
+    if out.status.success() {
+        println!("Pushed cognitive-debt/v1 to origin.");
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("Push failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+fn sync_pull() -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["fetch", "origin", "cognitive-debt/v1:cognitive-debt/v1"])
+        .output()
+        .context("Failed to run git fetch")?;
+    if out.status.success() {
+        println!("Pulled cognitive-debt/v1 from origin.");
+        println!("Run `git-cognitive debt` to see the updated state.");
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("Pull failed: {}", stderr.trim());
+    }
     Ok(())
 }
 
@@ -574,7 +386,7 @@ fn enable_claude() -> Result<()> {
 
     // --- post-commit hook ---
     let post_commit = git_hooks_dir.join("post-commit");
-    let post_commit_script = "#!/bin/sh\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit push origin cognitive-debt/v1 2>/dev/null || true\n";
+    let post_commit_script = "#!/bin/sh\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
 
     let should_write = if post_commit.exists() {
         let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
@@ -587,7 +399,7 @@ fn enable_claude() -> Result<()> {
         if post_commit.exists() {
             let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
             let appended = format!(
-                "{}\n# git-cognitive cognitive debt audit\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit push origin cognitive-debt/v1 2>/dev/null || true\n",
+                "{}\n# git-cognitive cognitive debt audit\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
                 existing.trim()
             );
             std::fs::write(&post_commit, appended)?;
@@ -605,69 +417,9 @@ fn enable_claude() -> Result<()> {
         println!("  .git/hooks/post-commit already configured — nothing to do.");
     }
 
-    // --- Claude Code Stop hook (session capture) ---
-    let claude_hooks_dir = PathBuf::from(".claude/hooks");
-    std::fs::create_dir_all(&claude_hooks_dir).context("Failed to create .claude/hooks")?;
-
-    let capture_script = r#"#!/bin/bash
-INPUT=$(cat)
-SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
-if [ -n "$SESSION_ID" ]; then
-  git-cognitive session capture --session-id "$SESSION_ID" 2>/dev/null || true
-  git push origin cognitive-debt/v1 2>/dev/null || true
-fi
-exit 0
-"#;
-
-    let capture_path = claude_hooks_dir.join("cognitive-capture.sh");
-    std::fs::write(&capture_path, capture_script)
-        .context("Failed to write cognitive-capture.sh")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&capture_path, std::fs::Permissions::from_mode(0o755))
-            .context("Failed to set cognitive-capture.sh permissions")?;
-    }
-    println!("  wrote .claude/hooks/cognitive-capture.sh");
-
-    // --- settings.json Stop hook ---
-    let settings_path = PathBuf::from(".claude/settings.json");
-    let marker = "cognitive:claude-setup";
-
-    if settings_path.exists() {
-        let existing = std::fs::read_to_string(&settings_path).unwrap_or_default();
-        if existing.contains(marker) {
-            println!("  .claude/settings.json already configured — nothing to do.");
-        } else if existing.contains("\"Stop\"") {
-            println!("  .claude/settings.json has existing Stop hooks — manually add:");
-            println!("    {{ \"type\": \"command\", \"command\": \".claude/hooks/cognitive-capture.sh\" }}");
-        } else {
-            println!("  .claude/settings.json exists — manually add Stop hook:");
-            println!("    {{ \"hooks\": {{ \"Stop\": [{{ \"hooks\": [{{ \"type\": \"command\", \"command\": \".claude/hooks/cognitive-capture.sh\" }}] }}] }} }}");
-        }
-    } else {
-        let settings = format!(
-            r#"{{
-  "_comment": "{}",
-  "hooks": {{
-    "Stop": [
-      {{
-        "hooks": [{{ "type": "command", "command": ".claude/hooks/cognitive-capture.sh" }}]
-      }}
-    ]
-  }}
-}}
-"#,
-            marker
-        );
-        std::fs::write(&settings_path, settings)
-            .context("Failed to write .claude/settings.json")?;
-        println!("  wrote .claude/settings.json");
-    }
-
-    println!("\nDone. Claude Code will now:");
-    println!("  • audit every commit for cognitive debt (post-commit hook)");
-    println!("  • capture session transcripts for AI attribution (Stop hook)");
-    println!("  • push cognitive-debt/v1 automatically");
+    println!("\nDone. Every commit will now:");
+    println!("  • snapshot the active Claude session");
+    println!("  • attribute AI lines to that commit");
+    println!("  • score friction and classify");
     Ok(())
 }

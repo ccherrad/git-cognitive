@@ -16,7 +16,6 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 branch TEXT NOT NULL,
                 classification TEXT NOT NULL,
-                subsystem TEXT NOT NULL,
                 title TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 commits_json TEXT NOT NULL,
@@ -49,13 +48,12 @@ impl Database {
         self.conn
             .execute(
                 "INSERT INTO activity_items
-                (id, branch, classification, subsystem, title, summary, commits_json,
+                (id, branch, classification, title, summary, commits_json,
                  since_sha, until_sha, cognitive_friction_score, ai_attributed,
                  attribution_pct, zombie, endorsement_status, audited_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(id) DO UPDATE SET
                 classification=excluded.classification,
-                subsystem=excluded.subsystem,
                 title=excluded.title,
                 summary=excluded.summary,
                 commits_json=excluded.commits_json,
@@ -71,7 +69,6 @@ impl Database {
                     &item.id,
                     &item.branch,
                     item.classification.to_string(),
-                    &item.subsystem,
                     &item.title,
                     &item.summary,
                     &commits_json,
@@ -121,7 +118,7 @@ impl Database {
         use crate::cognitive_debt::{ActivityItem, Classification, EndorsementStatus};
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, branch, classification, subsystem, title, summary, commits_json,
+            "SELECT id, branch, classification, title, summary, commits_json,
                     since_sha, until_sha, cognitive_friction_score, ai_attributed,
                     attribution_pct, zombie, endorsement_status, audited_at
              FROM activity_items ORDER BY audited_at DESC",
@@ -138,13 +135,12 @@ impl Database {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, f64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, Option<f64>>(11)?,
-                    row.get::<_, i64>(12)?,
+                    row.get::<_, f64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<f64>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
                 ))
             })?
             .map(|row| {
@@ -152,7 +148,6 @@ impl Database {
                     id,
                     branch,
                     classification,
-                    subsystem,
                     title,
                     summary,
                     commits_json,
@@ -173,16 +168,14 @@ impl Database {
                     "new_feature" => Classification::NewFeature,
                     "refactor" => Classification::Refactor,
                     "bug_fix" => Classification::BugFix,
-                    "subsystem_change" => Classification::SubsystemChange,
                     "minor" => Classification::Minor,
                     "risk" => Classification::Risk,
                     "tech_debt" => Classification::TechDebt,
                     "dependency_update" => Classification::DependencyUpdate,
-                    _ => Classification::Minor,
+                    _ => Classification::Other,
                 };
 
                 let endorsement_status = match endorsement_status.as_str() {
-                    "reviewed" => EndorsementStatus::Reviewed,
                     "endorsed" => EndorsementStatus::Endorsed,
                     "excluded" => EndorsementStatus::Excluded,
                     _ => EndorsementStatus::Unendorsed,
@@ -192,7 +185,6 @@ impl Database {
                     id,
                     branch,
                     classification,
-                    subsystem,
                     title,
                     summary,
                     commits,

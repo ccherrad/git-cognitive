@@ -11,11 +11,11 @@ pub enum Classification {
     NewFeature,
     Refactor,
     BugFix,
-    SubsystemChange,
     Minor,
     Risk,
     TechDebt,
     DependencyUpdate,
+    Other,
 }
 
 impl std::fmt::Display for Classification {
@@ -24,11 +24,11 @@ impl std::fmt::Display for Classification {
             Classification::NewFeature => "new_feature",
             Classification::Refactor => "refactor",
             Classification::BugFix => "bug_fix",
-            Classification::SubsystemChange => "subsystem_change",
             Classification::Minor => "minor",
             Classification::Risk => "risk",
             Classification::TechDebt => "tech_debt",
             Classification::DependencyUpdate => "dependency_update",
+            Classification::Other => "other",
         };
         write!(f, "{}", s)
     }
@@ -38,7 +38,6 @@ impl std::fmt::Display for Classification {
 #[serde(rename_all = "snake_case")]
 pub enum EndorsementStatus {
     Unendorsed,
-    Reviewed,
     Endorsed,
     Excluded,
 }
@@ -47,7 +46,6 @@ impl std::fmt::Display for EndorsementStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             EndorsementStatus::Unendorsed => "unendorsed",
-            EndorsementStatus::Reviewed => "reviewed",
             EndorsementStatus::Endorsed => "endorsed",
             EndorsementStatus::Excluded => "excluded",
         };
@@ -60,7 +58,6 @@ pub struct ActivityItem {
     pub id: String,
     pub branch: String,
     pub classification: Classification,
-    pub subsystem: String,
     pub title: String,
     pub summary: String,
     pub commits: Vec<String>,
@@ -133,6 +130,27 @@ pub fn read_endorsements_from_branch(
 
     let records = serde_json::from_slice(&out.stdout).unwrap_or_default();
     Ok(records)
+}
+
+pub fn read_session_slice_from_branch(repo_path: &Path, sha: &str) -> Result<Vec<String>> {
+    let shard = shard_path(sha);
+    let git_path = format!("cognitive-debt/v1:{}/session.jsonl", shard);
+
+    let out = Command::new("git")
+        .current_dir(repo_path)
+        .args(["show", &git_path])
+        .output()
+        .context("Failed to run git show for session slice")?;
+
+    if !out.status.success() {
+        return Ok(vec![]);
+    }
+
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
 }
 
 fn ensure_debt_branch(repo_path: &Path) -> Result<()> {
@@ -325,19 +343,18 @@ impl DebtStore {
         Ok(())
     }
 
-    pub fn write_session(
-        &self,
-        commit_sha: &str,
-        capture: &crate::session::SessionCapture,
-    ) -> Result<()> {
+    pub fn write_session(&self, commit_sha: &str, slice: &[String]) -> Result<()> {
+        if slice.is_empty() {
+            return Ok(());
+        }
         let shard = shard_path(commit_sha);
         let dir = self.worktree_path.join(&shard);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create shard dir {}", shard))?;
 
-        let json =
-            serde_json::to_string_pretty(capture).context("Failed to serialize session capture")?;
-        std::fs::write(dir.join("session.json"), json).context("Failed to write session.json")?;
+        let content = slice.join("\n") + "\n";
+        std::fs::write(dir.join("session.jsonl"), content)
+            .context("Failed to write session.jsonl")?;
 
         Ok(())
     }

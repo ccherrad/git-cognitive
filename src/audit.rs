@@ -7,6 +7,8 @@ use crate::cognitive_debt::{
     detect_ai_attribution, now_rfc3339, ActivityItem, Classification, DebtStore, EndorsementStatus,
 };
 use crate::db::Database;
+use crate::session::{attribute_commit, Attribution};
+use crate::treesitter::{complexity_delta, detect_language, doc_gap_score};
 
 const AI_FREE_ZONE_PATTERNS: &[&str] = &[
     "auth/",
@@ -37,8 +39,8 @@ pub struct CommitInfo {
     pub short_sha: String,
     #[allow(dead_code)]
     pub author: String,
-    #[allow(dead_code)]
     pub timestamp: u64,
+    pub prev_timestamp: u64,
     pub message: String,
     pub files_changed: Vec<String>,
 }
@@ -67,22 +69,17 @@ pub fn run_audit(
 
     let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
 
-    let subsystem_map = load_subsystem_map(repo_path);
-
     let mut audited = 0usize;
 
     for commit in &commits {
-        let item = build_activity_item(repo_path, commit, &subsystem_map)?;
+        let (item, session_slice) = build_activity_item(repo_path, commit)?;
         store.write_activity(&item)?;
+        store.write_session(&commit.sha, &session_slice)?;
         db.upsert_activity_item(&item)?;
         audited += 1;
         println!(
-            "  {} [{}] {} — {} (friction: {:.2})",
-            &commit.short_sha,
-            item.classification,
-            item.subsystem,
-            item.title,
-            item.cognitive_friction_score
+            "  {} [{}] {} (friction: {:.2})",
+            &commit.short_sha, item.classification, item.title, item.cognitive_friction_score
         );
     }
 
@@ -111,13 +108,26 @@ pub fn run_audit(
 fn build_activity_item(
     repo_path: &Path,
     commit: &CommitInfo,
-    subsystem_map: &SubsystemMap,
-) -> Result<ActivityItem> {
-    let (ai_attributed, attribution_pct) = detect_ai_attribution(&commit.message);
+) -> Result<(ActivityItem, Vec<String>)> {
+    let Attribution {
+        ai_attributed,
+        attribution_pct,
+        session_slice,
+    } = attribute_commit(
+        repo_path,
+        &commit.sha,
+        commit.timestamp,
+        commit.prev_timestamp,
+    );
+
+    // Fall back to keyword heuristic if session found nothing.
+    let (ai_attributed, attribution_pct) = if attribution_pct.is_some() {
+        (ai_attributed, attribution_pct)
+    } else {
+        detect_ai_attribution(&commit.message)
+    };
 
     let classification = classify_commit(commit, ai_attributed, attribution_pct);
-
-    let subsystem = match_subsystem(&commit.files_changed, subsystem_map);
 
     let title = commit
         .message
@@ -143,23 +153,25 @@ fn build_activity_item(
         _ => EndorsementStatus::Unendorsed,
     };
 
-    Ok(ActivityItem {
-        id: commit.sha.clone(),
-        branch: current_branch(repo_path),
-        classification,
-        subsystem,
-        title,
-        summary,
-        commits: vec![commit.sha.clone()],
-        since_sha: commit.sha.clone(),
-        until_sha: commit.sha.clone(),
-        cognitive_friction_score: friction,
-        ai_attributed,
-        attribution_pct,
-        zombie: false,
-        endorsement_status,
-        audited_at: now_rfc3339(),
-    })
+    Ok((
+        ActivityItem {
+            id: commit.sha.clone(),
+            branch: current_branch(repo_path),
+            classification,
+            title,
+            summary,
+            commits: vec![commit.sha.clone()],
+            since_sha: commit.sha.clone(),
+            until_sha: commit.sha.clone(),
+            cognitive_friction_score: friction,
+            ai_attributed,
+            attribution_pct,
+            zombie: false,
+            endorsement_status,
+            audited_at: now_rfc3339(),
+        },
+        session_slice,
+    ))
 }
 
 fn classify_commit(
@@ -202,7 +214,7 @@ fn classify_commit(
         return Classification::Minor;
     }
 
-    Classification::SubsystemChange
+    Classification::Other
 }
 
 fn is_ai_free_zone(file: &str) -> bool {
@@ -216,195 +228,78 @@ fn is_dependency_file(file: &str) -> bool {
         .any(|p| file.ends_with(p) || file == *p)
 }
 
-struct SubsystemMap {
-    subsystems: Vec<(String, Vec<String>)>,
-}
-
-fn load_subsystem_map(_repo_path: &Path) -> SubsystemMap {
-    SubsystemMap { subsystems: vec![] }
-}
-
-fn match_subsystem(files: &[String], map: &SubsystemMap) -> String {
-    if map.subsystems.is_empty() {
-        return infer_subsystem_from_paths(files);
-    }
-
-    let mut best: Option<(&str, usize)> = None;
-
-    for (name, subsystem_files) in &map.subsystems {
-        let overlap = files.iter().filter(|f| subsystem_files.contains(f)).count();
-        if overlap > 0 && best.map(|(_, c)| overlap > c).unwrap_or(true) {
-            best = Some((name, overlap));
-        }
-    }
-
-    best.map(|(name, _)| name.to_string())
-        .unwrap_or_else(|| infer_subsystem_from_paths(files))
-}
-
-fn infer_subsystem_from_paths(files: &[String]) -> String {
-    let mut dir_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    for file in files {
-        let path = std::path::Path::new(file);
-        let components: Vec<_> = path.components().collect();
-        if components.len() >= 2 {
-            let dir = components[components.len() - 2]
-                .as_os_str()
-                .to_string_lossy()
-                .to_string();
-            *dir_counts.entry(dir).or_insert(0) += 1;
-        }
-    }
-
-    dir_counts
-        .into_iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(dir, _)| dir)
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 fn compute_friction_score(repo_path: &Path, commit: &CommitInfo) -> Result<f32> {
-    let complexity_delta = compute_complexity_delta(repo_path, &commit.sha, &commit.files_changed);
-    let doc_gap = compute_doc_gap(repo_path, &commit.sha);
+    let complexity = compute_complexity_delta(repo_path, &commit.sha, &commit.files_changed);
+    let doc_gap = compute_doc_gap(repo_path, &commit.sha, &commit.files_changed);
     let author_churn = compute_author_churn(repo_path, &commit.files_changed);
 
-    let score = (complexity_delta * 0.4) + (doc_gap * 0.4) + (author_churn * 0.2);
+    let score = (complexity * 0.4) + (doc_gap * 0.4) + (author_churn * 0.2);
     Ok(score.clamp(0.0, 1.0))
 }
 
-fn compute_complexity_delta(repo_path: &Path, sha: &str, files: &[String]) -> f32 {
-    let relevant: Vec<&String> = files
-        .iter()
-        .filter(|f| {
-            f.ends_with(".rs")
-                || f.ends_with(".py")
-                || f.ends_with(".ts")
-                || f.ends_with(".js")
-                || f.ends_with(".go")
-        })
-        .collect();
-
-    if relevant.is_empty() {
-        return 0.0;
-    }
-
-    let diff_stat = Command::new("git")
-        .current_dir(repo_path)
-        .args(["diff", &format!("{}^..{}", sha, sha), "--stat"])
-        .output();
-
-    let total_lines = match diff_stat {
-        Ok(out) if out.status.success() => {
-            let output = String::from_utf8_lossy(&out.stdout);
-            parse_diff_stat_total(&output)
-        }
-        _ => return 0.0,
-    };
-
-    let diff_output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["diff", &format!("{}^..{}", sha, sha)])
-        .output();
-
-    let (added, removed) = match diff_output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            count_conditional_lines(&text)
-        }
-        _ => (0usize, 0usize),
-    };
-
-    if total_lines == 0 {
-        return 0.0;
-    }
-
-    let conditional_ratio = (added + removed) as f32 / total_lines.max(1) as f32;
-    conditional_ratio.clamp(0.0, 1.0)
-}
-
-fn parse_diff_stat_total(stat: &str) -> usize {
-    for line in stat.lines().rev() {
-        if line.contains("insertion") || line.contains("deletion") {
-            let parts: Vec<&str> = line.split(',').collect();
-            let mut total = 0usize;
-            for part in parts {
-                let nums: String = part.chars().filter(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = nums.parse::<usize>() {
-                    total += n;
-                }
-            }
-            return total;
-        }
-    }
-    0
-}
-
-fn count_conditional_lines(diff: &str) -> (usize, usize) {
-    let keywords = [
-        "if ", "else ", "match ", "switch ", "for ", "while ", "catch ", "case ",
-    ];
-    let mut added = 0usize;
-    let mut removed = 0usize;
-
-    for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            let rest = line[1..].trim();
-            if keywords.iter().any(|k| rest.starts_with(k)) {
-                added += 1;
-            }
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            let rest = line[1..].trim();
-            if keywords.iter().any(|k| rest.starts_with(k)) {
-                removed += 1;
-            }
-        }
-    }
-
-    (added, removed)
-}
-
-fn compute_doc_gap(repo_path: &Path, sha: &str) -> f32 {
+fn fetch_file_at(repo_path: &Path, sha: &str, file: &str) -> Option<String> {
     let out = Command::new("git")
         .current_dir(repo_path)
-        .args(["diff", &format!("{}^..{}", sha, sha)])
-        .output();
+        .args(["show", &format!("{}:{}", sha, file)])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).ok()
+    } else {
+        None
+    }
+}
 
-    let diff = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return 0.0,
-    };
+fn fetch_file_at_parent(repo_path: &Path, sha: &str, file: &str) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(repo_path)
+        .args(["show", &format!("{}^:{}", sha, file)])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).ok()
+    } else {
+        None
+    }
+}
 
-    let mut logic_lines = 0usize;
-    let mut comment_lines = 0usize;
+fn compute_complexity_delta(repo_path: &Path, sha: &str, files: &[String]) -> f32 {
+    let mut total_delta = 0.0f32;
+    let mut count = 0usize;
 
-    for line in diff.lines() {
-        if !line.starts_with('+') || line.starts_with("+++") {
+    for file in files {
+        let Some(lang) = detect_language(file) else {
             continue;
-        }
-        let rest = line[1..].trim();
-        if rest.is_empty() {
-            continue;
-        }
-        if rest.starts_with("//")
-            || rest.starts_with('#')
-            || rest.starts_with("/*")
-            || rest.starts_with('*')
-            || rest.starts_with("\"\"\"")
-            || rest.starts_with("'''")
-        {
-            comment_lines += 1;
-        } else {
-            logic_lines += 1;
-        }
+        };
+        let new_src = fetch_file_at(repo_path, sha, file).unwrap_or_default();
+        let old_src = fetch_file_at_parent(repo_path, sha, file).unwrap_or_default();
+        total_delta += complexity_delta(&old_src, &new_src, &lang);
+        count += 1;
     }
 
-    if logic_lines == 0 {
+    if count == 0 {
         return 0.0;
     }
+    (total_delta / count as f32).clamp(0.0, 1.0)
+}
 
-    let doc_ratio = comment_lines as f32 / logic_lines as f32;
-    (1.0 - doc_ratio.min(1.0)).clamp(0.0, 1.0)
+fn compute_doc_gap(repo_path: &Path, sha: &str, files: &[String]) -> f32 {
+    let mut total = 0.0f32;
+    let mut count = 0usize;
+
+    for file in files {
+        let Some(lang) = detect_language(file) else {
+            continue;
+        };
+        let new_src = fetch_file_at(repo_path, sha, file).unwrap_or_default();
+        total += doc_gap_score(&new_src, &lang);
+        count += 1;
+    }
+
+    if count == 0 {
+        return 0.0;
+    }
+    (total / count as f32).clamp(0.0, 1.0)
 }
 
 fn compute_author_churn(repo_path: &Path, files: &[String]) -> f32 {
@@ -486,12 +381,14 @@ fn fetch_commit(repo_path: &Path, sha: &str) -> Result<CommitInfo> {
     let timestamp: u64 = parts[2].trim().parse().unwrap_or(0);
     let message = fetch_commit_message(repo_path, &full_sha)?;
     let files_changed = fetch_changed_files(repo_path, &full_sha)?;
+    let prev_timestamp = fetch_parent_timestamp(repo_path, &full_sha);
 
     Ok(CommitInfo {
         short_sha: full_sha[..8.min(full_sha.len())].to_string(),
         sha: full_sha,
         author,
         timestamp,
+        prev_timestamp,
         message,
         files_changed,
     })
@@ -517,18 +414,30 @@ fn parse_commit_log(repo_path: &Path, log: &str) -> Result<Vec<CommitInfo>> {
 
         let message = fetch_commit_message(repo_path, &full_sha).unwrap_or_default();
         let files_changed = fetch_changed_files(repo_path, &full_sha).unwrap_or_default();
+        let prev_timestamp = fetch_parent_timestamp(repo_path, &full_sha);
 
         commits.push(CommitInfo {
             short_sha: full_sha[..8.min(full_sha.len())].to_string(),
             sha: full_sha,
             author,
             timestamp,
+            prev_timestamp,
             message,
             files_changed,
         });
     }
 
     Ok(commits)
+}
+
+fn fetch_parent_timestamp(repo_path: &Path, sha: &str) -> u64 {
+    Command::new("git")
+        .current_dir(repo_path)
+        .args(["log", "-1", "--format=%at", &format!("{}^", sha)])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn fetch_commit_message(repo_path: &Path, sha: &str) -> Result<String> {
@@ -623,7 +532,7 @@ pub fn detect_zombies(repo_path: &Path, store: &DebtStore, db: &Database) -> Res
         println!(
             "  ZOMBIE {} [{}] {} — untouched {} days",
             &item.until_sha[..8.min(item.until_sha.len())],
-            item.subsystem,
+            item.classification,
             item.title,
             (now - commit_ts) / 86400
         );

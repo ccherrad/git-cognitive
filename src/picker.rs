@@ -15,7 +15,6 @@ pub struct PickerItem {
     pub sha: String,
     pub short_sha: String,
     pub classification: String,
-    pub subsystem: String,
     pub title: String,
     pub friction: f32,
     pub attribution_pct: Option<f32>,
@@ -31,8 +30,7 @@ impl PickerItem {
             sha: item.id.clone(),
             short_sha: item.id[..8.min(item.id.len())].to_string(),
             classification: item.classification.to_string(),
-            subsystem: item.subsystem.clone(),
-            title: item.title.chars().take(50).collect(),
+            title: item.title.chars().take(63).collect(),
             friction: item.cognitive_friction_score,
             attribution_pct: item.attribution_pct,
             endorsement_status: item.endorsement_status.to_string(),
@@ -77,8 +75,7 @@ struct Col {
 const COL_CURSOR: Col = Col { x: 0, width: 2 };
 const COL_BADGE: Col = Col { x: 2, width: 7 };
 const COL_ZOMBIE: Col = Col { x: 9, width: 2 };
-const COL_SUBSYSTEM: Col = Col { x: 11, width: 13 };
-const COL_TITLE: Col = Col { x: 24, width: 46 };
+const COL_TITLE: Col = Col { x: 11, width: 59 };
 const COL_FRICTION: Col = Col { x: 70, width: 11 };
 const COL_ATTRIB: Col = Col { x: 81, width: 7 };
 const COL_DAYS: Col = Col { x: 88, width: 5 };
@@ -126,15 +123,13 @@ fn badge_colors(c: &str) -> (&'static str, Color, Color) {
         "refactor" => ("RFCT", Color::White, Color::DarkGrey),
         "minor" => ("MIN ", Color::White, Color::DarkGrey),
         "dependency_update" => ("DEP ", Color::White, Color::DarkGrey),
-        "subsystem_change" => ("SYS ", Color::Black, Color::Cyan),
-        _ => ("    ", Color::White, Color::DarkGrey),
+        _ => ("OTH ", Color::White, Color::DarkGrey),
     }
 }
 
 fn status_color(s: &str) -> (&'static str, Color) {
     match s {
         "endorsed" => ("endorsed", Color::Green),
-        "reviewed" => ("reviewed", Color::Yellow),
         "excluded" => ("excluded", Color::DarkGrey),
         _ => ("unendorsed", Color::Red),
     }
@@ -201,15 +196,6 @@ fn render_row(
         write_cell(stdout, row, &COL_ZOMBIE, "☠", Some(Color::Red), bg, true)?;
     }
 
-    write_cell(
-        stdout,
-        row,
-        &COL_SUBSYSTEM,
-        &item.subsystem,
-        Some(Color::White),
-        bg,
-        false,
-    )?;
     write_cell(
         stdout,
         row,
@@ -310,8 +296,8 @@ fn picker_loop(stdout: &mut io::Stdout, items: &[PickerItem]) -> Result<Option<S
         )?;
 
         let col_header = format!(
-            "  {:<6} {:<2} {:<13}{:<46}{:<11}{:<7}{:<5}{}",
-            "TYPE", "☠", "SUBSYSTEM", "TITLE", "FRICTION", "AI", "AGE", "STATUS"
+            "  {:<6} {:<2} {:<59}{:<11}{:<7}{:<5}{}",
+            "TYPE", "☠", "TITLE", "FRICTION", "AI", "AGE", "STATUS"
         );
         queue!(
             stdout,
@@ -338,8 +324,8 @@ fn picker_loop(stdout: &mut io::Stdout, items: &[PickerItem]) -> Result<Option<S
         let detail_row = rows - footer_rows;
         let item = &items[selected];
         let detail = format!(
-            " {} {}  friction {:.2}  {}",
-            item.short_sha, item.subsystem, item.friction, item.endorsement_status,
+            " {}  friction {:.2}  {}",
+            item.short_sha, item.friction, item.endorsement_status,
         );
         queue!(
             stdout,
@@ -347,7 +333,7 @@ fn picker_loop(stdout: &mut io::Stdout, items: &[PickerItem]) -> Result<Option<S
             style::PrintStyledContent(style::style(&*detail).white())
         )?;
 
-        let help = "  ↑↓/jk navigate   r reviewed   e/Enter endorse   s git show   q quit";
+        let help = "  ↑↓/jk navigate   e/Enter endorse   s git show   q quit";
         queue!(
             stdout,
             cursor::MoveTo(0, detail_row + 1),
@@ -379,9 +365,6 @@ fn picker_loop(stdout: &mut io::Stdout, items: &[PickerItem]) -> Result<Option<S
                 }
                 (KeyCode::Char('e'), _) | (KeyCode::Enter, _) => {
                     return Ok(Some(items[selected].sha.clone()));
-                }
-                (KeyCode::Char('r'), _) => {
-                    return Ok(Some(format!("reviewed:{}", items[selected].sha)));
                 }
                 (KeyCode::Char('s'), _) => {
                     let sha = items[selected].sha.clone();
