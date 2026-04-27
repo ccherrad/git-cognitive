@@ -386,7 +386,7 @@ fn enable_claude() -> Result<()> {
 
     // --- post-commit hook ---
     let post_commit = git_hooks_dir.join("post-commit");
-    let post_commit_script = "#!/bin/sh\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
+    let post_commit_script = "#!/bin/sh\nsleep 2\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
 
     let should_write = if post_commit.exists() {
         let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
@@ -399,7 +399,7 @@ fn enable_claude() -> Result<()> {
         if post_commit.exists() {
             let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
             let appended = format!(
-                "{}\n# git-cognitive cognitive debt audit\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
+                "{}\n# git-cognitive cognitive debt audit\nsleep 2\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
                 existing.trim()
             );
             std::fs::write(&post_commit, appended)?;

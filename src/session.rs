@@ -11,12 +11,15 @@ fn find_active_session(repo_path: &Path) -> Option<PathBuf> {
 
     let cwd = repo_path.canonicalize().ok()?;
     let cwd_key = cwd.to_string_lossy().replace('/', "-");
-    let cwd_key = cwd_key.trim_start_matches('-').to_string();
 
     let project_dir = std::fs::read_dir(&projects_dir)
         .ok()?
         .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().contains(&cwd_key))?
+        .find(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name == cwd_key || name.trim_start_matches('-') == cwd_key.trim_start_matches('-')
+        })?
         .path();
 
     let mut sessions: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&project_dir)
@@ -39,29 +42,51 @@ fn parse_iso_ts(ts: &str) -> u64 {
         return 0;
     }
 
-    let out = Command::new("date")
-        .args(["-j", "-f", "%Y-%m-%dT%H:%M:%S", &ts[..19], "+%s"])
-        .output();
-    if let Ok(o) = out {
-        if o.status.success() {
-            return String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(0);
-        }
+    let date = &ts[..10];
+    let time = &ts[11..19];
+    let tz = &ts[19..];
+
+    let parts: Vec<u64> = date.split('-').filter_map(|p| p.parse().ok()).collect();
+    let tparts: Vec<u64> = time.split(':').filter_map(|p| p.parse().ok()).collect();
+    if parts.len() != 3 || tparts.len() != 3 {
+        return 0;
     }
 
-    let out = Command::new("date").args(["-d", ts, "+%s"]).output();
-    if let Ok(o) = out {
-        if o.status.success() {
-            return String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(0);
-        }
+    let (y, m, d) = (parts[0] as i64, parts[1] as i64, parts[2] as i64);
+    let (h, min, s) = (tparts[0] as i64, tparts[1] as i64, tparts[2] as i64);
+
+    let days = days_from_epoch(y, m, d);
+    let mut unix = days * 86400 + h * 3600 + min * 60 + s;
+
+    // strip milliseconds e.g. ".318" before parsing timezone
+    let tz = if tz.starts_with('.') {
+        let rest = tz.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+        rest.trim()
+    } else {
+        tz.trim()
+    };
+
+    // parse timezone offset e.g. "+0200", "-0530", "+02:00", "Z", ""
+    if tz == "Z" || tz.is_empty() {
+        // UTC
+    } else if tz.len() >= 5 {
+        let sign: i64 = if tz.starts_with('-') { -1 } else { 1 };
+        let tz_clean = tz[1..].replace(':', "");
+        let tz_h: i64 = tz_clean[..2].parse().unwrap_or(0);
+        let tz_m: i64 = tz_clean[2..4].parse().unwrap_or(0);
+        unix -= sign * (tz_h * 3600 + tz_m * 60);
     }
 
-    0
+    unix.max(0) as u64
+}
+
+fn days_from_epoch(y: i64, m: i64, d: i64) -> i64 {
+    let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let a = y / 100;
+    let b = 2 - a + a / 4;
+    ((365.25 * (y + 4716) as f64) as i64) + ((30.6001 * (m + 1) as f64) as i64) + d + b
+        - 1524
+        - 2440588
 }
 
 fn normalize_path(path: &str) -> String {
