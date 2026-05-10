@@ -3,25 +3,16 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
+use git_topology::{
+    is_stale, read_cluster_map, run_index as topology_run_index, ClusterMap, EmbeddingConfig,
+};
+
 use crate::cognitive_debt::{
     detect_ai_attribution, now_rfc3339, ActivityItem, Classification, DebtStore, EndorsementStatus,
 };
 use crate::db::Database;
 use crate::session::{attribute_commit, Attribution};
 use crate::treesitter::{complexity_delta, detect_language, doc_gap_score};
-
-const AI_FREE_ZONE_PATTERNS: &[&str] = &[
-    "auth/",
-    "authentication/",
-    "authorization/",
-    "payments/",
-    "payment/",
-    "billing/",
-    "migrations/",
-    "migration/",
-    "schema",
-    ".sql",
-];
 
 const DEPENDENCY_PATTERNS: &[&str] = &[
     "Cargo.lock",
@@ -37,20 +28,36 @@ const DEPENDENCY_PATTERNS: &[&str] = &[
 pub struct CommitInfo {
     pub sha: String,
     pub short_sha: String,
-    #[allow(dead_code)]
-    pub author: String,
     pub timestamp: u64,
     pub prev_timestamp: u64,
     pub message: String,
     pub files_changed: Vec<String>,
 }
 
-pub fn run_audit(
+fn hydrate_cluster_map(repo_path: &Path) -> Result<ClusterMap> {
+    if is_stale(repo_path) {
+        if !EmbeddingConfig::is_provider_configured() {
+            anyhow::bail!(
+                "Topology index is missing or stale but topology.provider is not configured.\n\
+                Run: git config topology.provider gemma\n\
+                  or: git config topology.provider openai"
+            );
+        }
+        println!("Topology index is stale — re-indexing...");
+        let config = EmbeddingConfig::load_or_default()?;
+        return topology_run_index(repo_path, config);
+    }
+    Ok(read_cluster_map(repo_path)?.unwrap_or_else(ClusterMap::empty))
+}
+
+pub fn run_index(
     repo_path: &Path,
     since_sha: Option<&str>,
     single_commit: Option<&str>,
     check_zombies: bool,
 ) -> Result<()> {
+    let cluster_map = hydrate_cluster_map(repo_path)?;
+
     let commits = if let Some(sha) = single_commit {
         vec![fetch_commit(repo_path, sha)?]
     } else {
@@ -61,7 +68,7 @@ pub fn run_audit(
     };
 
     if commits.is_empty() && !check_zombies {
-        println!("Nothing to audit — already up to date.");
+        println!("Nothing to index — already up to date.");
         return Ok(());
     }
 
@@ -72,7 +79,7 @@ pub fn run_audit(
     let mut audited = 0usize;
 
     for commit in &commits {
-        let (item, session_slice) = build_activity_item(repo_path, commit)?;
+        let (item, session_slice) = build_activity_item(repo_path, commit, &cluster_map)?;
         store.write_activity(&item)?;
         store.write_session(&commit.sha, &session_slice)?;
         db.upsert_activity_item(&item)?;
@@ -99,7 +106,7 @@ pub fn run_audit(
     }
 
     if audited > 0 || check_zombies {
-        println!("Audit complete — {} commit(s) processed.", audited);
+        println!("Index complete — {} commit(s) processed.", audited);
     }
 
     Ok(())
@@ -108,6 +115,7 @@ pub fn run_audit(
 fn build_activity_item(
     repo_path: &Path,
     commit: &CommitInfo,
+    cluster_map: &ClusterMap,
 ) -> Result<(ActivityItem, Vec<String>)> {
     let Attribution {
         ai_attributed,
@@ -127,7 +135,7 @@ fn build_activity_item(
         detect_ai_attribution(&commit.message)
     };
 
-    let classification = classify_commit(commit, ai_attributed, attribution_pct);
+    let classification = classify_commit(commit, ai_attributed, attribution_pct, cluster_map);
 
     let title = commit
         .message
@@ -178,12 +186,17 @@ fn classify_commit(
     commit: &CommitInfo,
     ai_attributed: bool,
     attribution_pct: Option<f32>,
+    cluster_map: &ClusterMap,
 ) -> Classification {
     if commit.files_changed.iter().any(|f| is_dependency_file(f)) {
         return Classification::DependencyUpdate;
     }
 
-    if commit.files_changed.iter().any(|f| is_ai_free_zone(f)) {
+    if ai_attributed
+        && !cluster_map
+            .clusters_for_files(&commit.files_changed)
+            .is_empty()
+    {
         return Classification::Risk;
     }
 
@@ -217,15 +230,115 @@ fn classify_commit(
     Classification::Other
 }
 
-fn is_ai_free_zone(file: &str) -> bool {
-    let lower = file.to_lowercase();
-    AI_FREE_ZONE_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
 fn is_dependency_file(file: &str) -> bool {
     DEPENDENCY_PATTERNS
         .iter()
         .any(|p| file.ends_with(p) || file == *p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_commit(message: &str, files: &[&str]) -> CommitInfo {
+        CommitInfo {
+            sha: "abcdef1234567890".to_string(),
+            short_sha: "abcdef12".to_string(),
+            timestamp: 0,
+            prev_timestamp: 0,
+            message: message.to_string(),
+            files_changed: files.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn dependency_file_detection() {
+        assert!(is_dependency_file("Cargo.lock"));
+        assert!(is_dependency_file("package-lock.json"));
+        assert!(is_dependency_file("go.sum"));
+        assert!(is_dependency_file("frontend/yarn.lock"));
+        assert!(!is_dependency_file("src/main.rs"));
+    }
+
+    #[test]
+    fn classify_dependency_update() {
+        let commit = make_commit("chore: bump deps", &["Cargo.lock"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, false, None, &map),
+            Classification::DependencyUpdate
+        );
+    }
+
+    #[test]
+    fn classify_bug_fix() {
+        let commit = make_commit("fix: null pointer in auth", &["src/auth.rs"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, false, None, &map),
+            Classification::BugFix
+        );
+    }
+
+    #[test]
+    fn classify_new_feature_human() {
+        let commit = make_commit("feat: add search endpoint", &["src/search.rs"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, false, None, &map),
+            Classification::NewFeature
+        );
+    }
+
+    #[test]
+    fn classify_risk_high_ai_feat() {
+        let commit = make_commit("feat: add payment flow", &["src/payments.rs"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, true, Some(0.9), &map),
+            Classification::Risk
+        );
+    }
+
+    #[test]
+    fn classify_tech_debt_high_ai_refactor() {
+        let commit = make_commit("refactor: extract helper", &["src/lib.rs"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, true, Some(0.8), &map),
+            Classification::TechDebt
+        );
+    }
+
+    #[test]
+    fn classify_refactor_low_ai() {
+        let commit = make_commit("refactor: clean up", &["src/lib.rs"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, false, Some(0.1), &map),
+            Classification::Refactor
+        );
+    }
+
+    #[test]
+    fn classify_minor_docs() {
+        let commit = make_commit("docs: update readme", &["README.md"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, false, None, &map),
+            Classification::Minor
+        );
+    }
+
+    #[test]
+    fn classify_other() {
+        let commit = make_commit("wip: something", &["src/foo.rs"]);
+        let map = ClusterMap::empty();
+        assert_eq!(
+            classify_commit(&commit, false, None, &map),
+            Classification::Other
+        );
+    }
 }
 
 fn compute_friction_score(repo_path: &Path, commit: &CommitInfo) -> Result<f32> {
@@ -343,14 +456,14 @@ fn fetch_commits_since(repo_path: &Path, since_sha: Option<&str>) -> Result<Vec<
 
     let out = Command::new("git")
         .current_dir(repo_path)
-        .args(["log", &range, "--format=%H %ae %at %s", "--reverse"])
+        .args(["log", &range, "--format=%H %at %s", "--reverse"])
         .output()
         .context("Failed to run git log")?;
 
     if !out.status.success() {
         let out_all = Command::new("git")
             .current_dir(repo_path)
-            .args(["log", "-50", "--format=%H %ae %at %s", "--reverse"])
+            .args(["log", "-50", "--format=%H %at %s", "--reverse"])
             .output()
             .context("Failed to run git log")?;
         return parse_commit_log(repo_path, &String::from_utf8_lossy(&out_all.stdout));
@@ -362,7 +475,7 @@ fn fetch_commits_since(repo_path: &Path, since_sha: Option<&str>) -> Result<Vec<
 fn fetch_commit(repo_path: &Path, sha: &str) -> Result<CommitInfo> {
     let out = Command::new("git")
         .current_dir(repo_path)
-        .args(["log", "-1", "--format=%H %ae %at", sha])
+        .args(["log", "-1", "--format=%H %at", sha])
         .output()
         .context("Failed to run git log")?;
 
@@ -371,14 +484,13 @@ fn fetch_commit(repo_path: &Path, sha: &str) -> Result<CommitInfo> {
     }
 
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let parts: Vec<&str> = line.splitn(3, ' ').collect();
-    if parts.len() < 3 {
+    let parts: Vec<&str> = line.splitn(2, ' ').collect();
+    if parts.len() < 2 {
         anyhow::bail!("Unexpected git log output: {}", line);
     }
 
     let full_sha = parts[0].to_string();
-    let author = parts[1].to_string();
-    let timestamp: u64 = parts[2].trim().parse().unwrap_or(0);
+    let timestamp: u64 = parts[1].trim().parse().unwrap_or(0);
     let message = fetch_commit_message(repo_path, &full_sha)?;
     let files_changed = fetch_changed_files(repo_path, &full_sha)?;
     let prev_timestamp = fetch_parent_timestamp(repo_path, &full_sha);
@@ -386,7 +498,6 @@ fn fetch_commit(repo_path: &Path, sha: &str) -> Result<CommitInfo> {
     Ok(CommitInfo {
         short_sha: full_sha[..8.min(full_sha.len())].to_string(),
         sha: full_sha,
-        author,
         timestamp,
         prev_timestamp,
         message,
@@ -403,14 +514,13 @@ fn parse_commit_log(repo_path: &Path, log: &str) -> Result<Vec<CommitInfo>> {
             continue;
         }
 
-        let parts: Vec<&str> = line.splitn(4, ' ').collect();
-        if parts.len() < 3 {
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() < 2 {
             continue;
         }
 
         let full_sha = parts[0].to_string();
-        let author = parts[1].to_string();
-        let timestamp: u64 = parts[2].parse().unwrap_or(0);
+        let timestamp: u64 = parts[1].parse().unwrap_or(0);
 
         let message = fetch_commit_message(repo_path, &full_sha).unwrap_or_default();
         let files_changed = fetch_changed_files(repo_path, &full_sha).unwrap_or_default();
@@ -419,7 +529,6 @@ fn parse_commit_log(repo_path: &Path, log: &str) -> Result<Vec<CommitInfo>> {
         commits.push(CommitInfo {
             short_sha: full_sha[..8.min(full_sha.len())].to_string(),
             sha: full_sha,
-            author,
             timestamp,
             prev_timestamp,
             message,
@@ -471,10 +580,10 @@ fn current_branch(repo_path: &Path) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-const LAST_AUDIT_FILE: &str = ".git/cognitive-debt-last-audit";
+const LAST_INDEX_FILE: &str = ".git/cognitive-last-index";
 
 fn read_last_audit_sha(repo_path: &Path) -> Option<String> {
-    let path = repo_path.join(LAST_AUDIT_FILE);
+    let path = repo_path.join(LAST_INDEX_FILE);
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -482,8 +591,8 @@ fn read_last_audit_sha(repo_path: &Path) -> Option<String> {
 }
 
 fn write_last_audit_sha(repo_path: &Path, sha: &str) -> Result<()> {
-    let path = repo_path.join(LAST_AUDIT_FILE);
-    std::fs::write(path, sha).context("Failed to write last audit SHA")
+    let path = repo_path.join(LAST_INDEX_FILE);
+    std::fs::write(path, sha).context("Failed to write last index SHA")
 }
 
 pub fn detect_zombies(repo_path: &Path, store: &DebtStore, db: &Database) -> Result<usize> {

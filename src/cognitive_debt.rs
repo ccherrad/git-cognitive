@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEBT_BRANCH: &str = "cognitive-debt/v1";
+const DEBT_BRANCH: &str = "cognitive/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -95,7 +95,7 @@ fn shard_path(id: &str) -> String {
 
 pub fn read_activity_from_branch(repo_path: &Path, sha: &str) -> Result<Option<ActivityItem>> {
     let shard = shard_path(sha);
-    let git_path = format!("cognitive-debt/v1:{}/activity.json", shard);
+    let git_path = format!("cognitive/v1:{}/activity.json", shard);
 
     let out = Command::new("git")
         .current_dir(repo_path)
@@ -116,7 +116,7 @@ pub fn read_endorsements_from_branch(
     sha: &str,
 ) -> Result<Vec<EndorsementRecord>> {
     let shard = shard_path(sha);
-    let git_path = format!("cognitive-debt/v1:{}/endorsements.json", shard);
+    let git_path = format!("cognitive/v1:{}/endorsements.json", shard);
 
     let out = Command::new("git")
         .current_dir(repo_path)
@@ -134,7 +134,7 @@ pub fn read_endorsements_from_branch(
 
 pub fn read_session_slice_from_branch(repo_path: &Path, sha: &str) -> Result<Vec<String>> {
     let shard = shard_path(sha);
-    let git_path = format!("cognitive-debt/v1:{}/session.jsonl", shard);
+    let git_path = format!("cognitive/v1:{}/session.jsonl", shard);
 
     let out = Command::new("git")
         .current_dir(repo_path)
@@ -442,6 +442,92 @@ fn collect_activity_items(_base: &Path, dir: &Path, result: &mut Vec<ActivityIte
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_agent_attribution_percentage() {
+        assert_eq!(
+            parse_agent_attribution("feat: add thing\n\nAgent-Attribution: 75%"),
+            Some(0.75)
+        );
+    }
+
+    #[test]
+    fn parse_agent_attribution_entire() {
+        assert_eq!(
+            parse_agent_attribution("Entire-Attribution: 100%"),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn parse_agent_attribution_none() {
+        assert_eq!(parse_agent_attribution("fix: normal commit"), None);
+    }
+
+    #[test]
+    fn detect_ai_attribution_from_trailer() {
+        let (ai, pct) = detect_ai_attribution("feat: thing\n\nAgent-Attribution: 80%");
+        assert!(ai);
+        assert_eq!(pct, Some(0.8));
+    }
+
+    #[test]
+    fn detect_ai_attribution_co_authored_by_claude() {
+        let (ai, pct) = detect_ai_attribution("fix: bug\n\nCo-Authored-By: Claude Sonnet");
+        assert!(ai);
+        assert_eq!(pct, None);
+    }
+
+    #[test]
+    fn detect_ai_attribution_human_commit() {
+        let (ai, pct) = detect_ai_attribution("refactor: clean up logic");
+        assert!(!ai);
+        assert_eq!(pct, None);
+    }
+
+    #[test]
+    fn detect_ai_attribution_low_pct_not_attributed() {
+        let (ai, pct) = detect_ai_attribution("fix: small tweak\n\nAgent-Attribution: 30%");
+        assert!(!ai);
+        assert_eq!(pct, Some(0.3));
+    }
+
+    #[test]
+    fn shard_path_structure() {
+        let s = shard_path("abcdef1234");
+        assert_eq!(s, "ab/cd/ef");
+    }
+
+    #[test]
+    fn now_rfc3339_format() {
+        let ts = now_rfc3339();
+        assert!(ts.contains('T'));
+        assert!(ts.ends_with('Z'));
+        assert_eq!(ts.len(), 20);
+    }
+
+    #[test]
+    fn classification_display() {
+        assert_eq!(Classification::NewFeature.to_string(), "new_feature");
+        assert_eq!(Classification::Risk.to_string(), "risk");
+        assert_eq!(Classification::TechDebt.to_string(), "tech_debt");
+        assert_eq!(
+            Classification::DependencyUpdate.to_string(),
+            "dependency_update"
+        );
+    }
+
+    #[test]
+    fn endorsement_status_display() {
+        assert_eq!(EndorsementStatus::Unendorsed.to_string(), "unendorsed");
+        assert_eq!(EndorsementStatus::Endorsed.to_string(), "endorsed");
+        assert_eq!(EndorsementStatus::Excluded.to_string(), "excluded");
+    }
 }
 
 pub fn parse_agent_attribution(commit_message: &str) -> Option<f32> {

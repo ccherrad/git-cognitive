@@ -17,12 +17,12 @@ Every `git commit` automatically:
 1. Slices the active Claude Code session to the window between this commit and the previous one
 2. Attributes AI lines by matching agent Write/Edit tool calls against the commit diff
 3. Scores friction via tree-sitter AST analysis (complexity delta, doc gap, author churn)
-4. Classifies the commit and writes to the `cognitive-debt/v1` orphan branch
+4. Classifies the commit and writes to the `cognitive/v1` orphan branch
 
 Each commit gets three files stored in a sharded orphan branch:
 
 ```
-cognitive-debt/v1
+cognitive/v1
 └── ab/cd/ef1234/
     ├── activity.json     — classification, friction score, AI attribution, endorsement status
     ├── endorsements.json — who endorsed it and when
@@ -87,13 +87,13 @@ git-cognitive enable claude
 
 Writes `.git/hooks/post-commit` to auto-audit and push on every commit.
 
-### `audit`
+### `index`
 
 ```
-git-cognitive audit [--commit <SHA>|HEAD] [--since <SHA>] [--all] [--check-zombies]
+git-cognitive index [--commit <SHA>|HEAD] [--since <SHA>] [--all] [--check-zombies]
 ```
 
-Walks commits and writes activity to `cognitive-debt/v1`. Run manually to backfill history.
+Walks commits and writes activity to `cognitive/v1`. Run manually to backfill history.
 
 - `--all` — backfill last 500 commits
 - `--check-zombies` — flag AI commits unendorsed >30 days with no human follow-up
@@ -140,13 +140,13 @@ git-cognitive push
 git-cognitive pull
 ```
 
-Share cognitive debt data with your team via the `cognitive-debt/v1` branch.
+Share cognitive debt data with your team via the `cognitive/v1` branch.
 
 ## Classifications
 
 | Class | Trigger |
 |---|---|
-| `risk` | AI ≥70% + feat, or files in `auth/`, `payments/`, `migrations/`, `.sql` |
+| `risk` | AI-attributed + files in a semantic cluster (topology index), or AI ≥70% + feat |
 | `tech_debt` | AI ≥70% + refactor/chore |
 | `new_feature` | `feat:`, `add:`, `new:` + low AI |
 | `bug_fix` | `fix:`, `bug:` |
@@ -162,7 +162,7 @@ A zombie is an AI-attributed commit that:
 2. Has had no human follow-up commit touching the same files
 
 ```sh
-git-cognitive audit --check-zombies
+git-cognitive index --check-zombies
 ```
 
 ## Agent-Attribution trailer
@@ -186,7 +186,7 @@ git-cognitive debt
 git-cognitive endorse
 
 # weekly
-git-cognitive audit --check-zombies
+git-cognitive index --check-zombies
 ```
 
 ## See also

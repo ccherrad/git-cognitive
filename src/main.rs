@@ -1,6 +1,6 @@
-mod audit;
 mod cognitive_debt;
 mod db;
+mod index;
 mod picker;
 mod session;
 mod treesitter;
@@ -22,12 +22,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Audit commits for cognitive debt")]
-    Audit {
-        #[arg(long, help = "Audit a specific commit SHA or HEAD")]
+    #[command(about = "Index commits for cognitive debt")]
+    Index {
+        #[arg(long, help = "Index a specific commit SHA or HEAD")]
         commit: Option<String>,
 
-        #[arg(long, help = "Audit all commits since this SHA")]
+        #[arg(long, help = "Index all commits since this SHA")]
         since: Option<String>,
 
         #[arg(long, help = "Backfill all history (last 500 commits)")]
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Audit {
+        Commands::Index {
             commit,
             since,
             all,
@@ -90,7 +90,7 @@ fn main() -> Result<()> {
             } else {
                 since
             };
-            audit::run_audit(
+            index::run_index(
                 &repo_path,
                 since.as_deref(),
                 commit.as_deref(),
@@ -204,7 +204,7 @@ fn show_command(sha: &str) -> Result<()> {
         None => {
             println!("No activity item found for {}.", &sha[..8.min(sha.len())]);
             println!(
-                "Run `git-cognitive audit --commit {}` first.",
+                "Run `git-cognitive index --commit {}` first.",
                 &sha[..8.min(sha.len())]
             );
         }
@@ -248,7 +248,7 @@ fn debt_interactive() -> Result<()> {
         let items = db.all_activity_items()?;
 
         if items.is_empty() {
-            println!("No activity items. Run `git-cognitive audit` first.");
+            println!("No activity items. Run `git-cognitive index` first.");
             break;
         }
 
@@ -272,7 +272,7 @@ fn debt_command() -> Result<()> {
         .context("Failed to load activity items")?;
 
     if items.is_empty() {
-        println!("No activity items found. Run `git-cognitive audit` first.");
+        println!("No activity items found. Run `git-cognitive index` first.");
         return Ok(());
     }
 
@@ -351,11 +351,11 @@ fn debt_command() -> Result<()> {
 
 fn sync_push() -> Result<()> {
     let out = std::process::Command::new("git")
-        .args(["push", "origin", "cognitive-debt/v1"])
+        .args(["push", "origin", "cognitive/v1"])
         .output()
         .context("Failed to run git push")?;
     if out.status.success() {
-        println!("Pushed cognitive-debt/v1 to origin.");
+        println!("Pushed cognitive/v1 to origin.");
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("Push failed: {}", stderr.trim());
@@ -365,11 +365,11 @@ fn sync_push() -> Result<()> {
 
 fn sync_pull() -> Result<()> {
     let out = std::process::Command::new("git")
-        .args(["fetch", "origin", "cognitive-debt/v1:cognitive-debt/v1"])
+        .args(["fetch", "origin", "cognitive/v1:cognitive/v1"])
         .output()
         .context("Failed to run git fetch")?;
     if out.status.success() {
-        println!("Pulled cognitive-debt/v1 from origin.");
+        println!("Pulled cognitive/v1 from origin.");
         println!("Run `git-cognitive debt` to see the updated state.");
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -386,11 +386,11 @@ fn enable_claude() -> Result<()> {
 
     // --- post-commit hook ---
     let post_commit = git_hooks_dir.join("post-commit");
-    let post_commit_script = "#!/bin/sh\nsleep 2\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
+    let post_commit_script = "#!/bin/sh\nsleep 2\ngit-cognitive index --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
 
     let should_write = if post_commit.exists() {
         let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
-        !existing.contains("git-cognitive audit")
+        !existing.contains("git-cognitive index")
     } else {
         true
     };
@@ -399,7 +399,7 @@ fn enable_claude() -> Result<()> {
         if post_commit.exists() {
             let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
             let appended = format!(
-                "{}\n# git-cognitive cognitive debt audit\nsleep 2\ngit-cognitive audit --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
+                "{}\n# git-cognitive cognitive debt index\nsleep 2\ngit-cognitive index --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
                 existing.trim()
             );
             std::fs::write(&post_commit, appended)?;
