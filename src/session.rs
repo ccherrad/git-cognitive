@@ -140,6 +140,8 @@ pub struct Attribution {
     pub attribution_pct: Option<f32>,
     /// The raw JSONL lines from the session that fall within this commit's window.
     pub session_slice: Vec<String>,
+    /// Duration in seconds of the session window (first to last message timestamp).
+    pub session_duration_secs: Option<u64>,
 }
 
 /// Attribute a commit to a Claude session.
@@ -159,6 +161,7 @@ pub fn attribute_commit(
             ai_attributed: false,
             attribution_pct: None,
             session_slice: vec![],
+            session_duration_secs: None,
         };
     };
 
@@ -169,6 +172,7 @@ pub fn attribute_commit(
                 ai_attributed: false,
                 attribution_pct: None,
                 session_slice: vec![],
+                session_duration_secs: None,
             }
         }
     };
@@ -176,6 +180,8 @@ pub fn attribute_commit(
     // Slice JSONL to the window (prev_commit_ts, commit_ts + 60s grace]
     let mut session_slice: Vec<String> = Vec::new();
     let mut agent_edits: Vec<(String, Vec<String>)> = Vec::new(); // (file, lines)
+    let mut first_ts: Option<u64> = None;
+    let mut last_ts: Option<u64> = None;
 
     for raw_line in content.lines() {
         let raw_line = raw_line.trim();
@@ -198,6 +204,11 @@ pub fn attribute_commit(
         if ts == 0 || ts <= prev_commit_ts || ts > commit_ts + 60 {
             continue;
         }
+
+        if first_ts.is_none() {
+            first_ts = Some(ts);
+        }
+        last_ts = Some(ts);
 
         session_slice.push(raw_line.to_string());
 
@@ -247,11 +258,17 @@ pub fn attribute_commit(
         }
     }
 
+    let session_duration_secs = match (first_ts, last_ts) {
+        (Some(f), Some(l)) if l > f => Some(l - f),
+        _ => None,
+    };
+
     if session_slice.is_empty() {
         return Attribution {
             ai_attributed: false,
             attribution_pct: None,
             session_slice: vec![],
+            session_duration_secs: None,
         };
     }
 
@@ -263,6 +280,7 @@ pub fn attribute_commit(
             ai_attributed: false,
             attribution_pct: None,
             session_slice,
+            session_duration_secs,
         };
     }
 
@@ -287,6 +305,7 @@ pub fn attribute_commit(
             ai_attributed: false,
             attribution_pct: None,
             session_slice,
+            session_duration_secs,
         };
     }
 
@@ -295,6 +314,7 @@ pub fn attribute_commit(
         ai_attributed: pct >= 0.3,
         attribution_pct: Some(pct),
         session_slice,
+        session_duration_secs,
     }
 }
 

@@ -251,6 +251,16 @@ fn show_command(sha: &str) -> Result<()> {
             if let Some(pct) = item.attribution_pct {
                 println!("  agent    {:.0}%", pct * 100.0);
             }
+            println!("  lines    {}", item.lines_changed);
+            if item.large_diff {
+                println!("  large_diff  yes (>100 lines, AI-attributed)");
+            }
+            if let Some(dur) = item.session_duration_secs {
+                println!("  session  {}h {}m", dur / 3600, (dur % 3600) / 60);
+            }
+            if item.fatigue {
+                println!("  fatigue  yes (commit after 3h+ session)");
+            }
             println!("  zombie   {}", if item.zombie { "yes" } else { "no" });
             println!("  status   {}", item.endorsement_status);
             println!("  audited  {}", item.audited_at);
@@ -571,6 +581,10 @@ fn mcp_debt(filter: &str) -> Result<serde_json::Value> {
                 "friction": i.cognitive_friction_score,
                 "ai_attributed": i.ai_attributed,
                 "attribution_pct": i.attribution_pct,
+                "lines_changed": i.lines_changed,
+                "large_diff": i.large_diff,
+                "session_duration_secs": i.session_duration_secs,
+                "fatigue": i.fatigue,
                 "zombie": i.zombie,
                 "status": i.endorsement_status.to_string(),
                 "audited_at": i.audited_at,
@@ -617,6 +631,10 @@ fn mcp_show(sha: &str) -> Result<serde_json::Value> {
                 "friction": item.cognitive_friction_score,
                 "ai_attributed": item.ai_attributed,
                 "attribution_pct": item.attribution_pct,
+                "lines_changed": item.lines_changed,
+                "large_diff": item.large_diff,
+                "session_duration_secs": item.session_duration_secs,
+                "fatigue": item.fatigue,
                 "zombie": item.zombie,
                 "status": item.endorsement_status.to_string(),
                 "audited_at": item.audited_at,

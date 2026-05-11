@@ -121,6 +121,7 @@ fn build_activity_item(
         ai_attributed,
         attribution_pct,
         session_slice,
+        session_duration_secs,
     } = attribute_commit(
         repo_path,
         &commit.sha,
@@ -154,7 +155,11 @@ fn build_activity_item(
         .trim()
         .to_string();
 
-    let friction = compute_friction_score(repo_path, commit)?;
+    let lines_changed = count_lines_changed(repo_path, &commit.sha);
+    let large_diff = ai_attributed && lines_changed > 100;
+    let fatigue = ai_attributed && session_duration_secs.map(|d| d >= 3 * 3600).unwrap_or(false);
+
+    let friction = compute_friction_score(repo_path, commit, large_diff, fatigue)?;
 
     let endorsement_status = match &classification {
         Classification::Minor | Classification::DependencyUpdate => EndorsementStatus::Excluded,
@@ -174,6 +179,10 @@ fn build_activity_item(
             cognitive_friction_score: friction,
             ai_attributed,
             attribution_pct,
+            lines_changed,
+            large_diff,
+            session_duration_secs,
+            fatigue,
             zombie: false,
             endorsement_status,
             audited_at: now_rfc3339(),
@@ -341,13 +350,48 @@ mod tests {
     }
 }
 
-fn compute_friction_score(repo_path: &Path, commit: &CommitInfo) -> Result<f32> {
+fn compute_friction_score(
+    repo_path: &Path,
+    commit: &CommitInfo,
+    large_diff: bool,
+    fatigue: bool,
+) -> Result<f32> {
     let complexity = compute_complexity_delta(repo_path, &commit.sha, &commit.files_changed);
     let doc_gap = compute_doc_gap(repo_path, &commit.sha, &commit.files_changed);
     let author_churn = compute_author_churn(repo_path, &commit.files_changed);
 
-    let score = (complexity * 0.4) + (doc_gap * 0.4) + (author_churn * 0.2);
+    let mut score = (complexity * 0.4) + (doc_gap * 0.4) + (author_churn * 0.2);
+    if large_diff {
+        score += 0.15;
+    }
+    if fatigue {
+        score += 0.20;
+    }
     Ok(score.clamp(0.0, 1.0))
+}
+
+fn count_lines_changed(repo_path: &Path, sha: &str) -> u32 {
+    let out = Command::new("git")
+        .current_dir(repo_path)
+        .args(["diff", "--shortstat", &format!("{}^..{}", sha, sha)])
+        .output();
+
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return 0,
+    };
+
+    // "3 files changed, 142 insertions(+), 12 deletions(-)"
+    let mut total = 0u32;
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.contains("insertion") || part.contains("deletion") {
+            if let Some(n) = part.split_whitespace().next() {
+                total += n.parse::<u32>().unwrap_or(0);
+            }
+        }
+    }
+    total
 }
 
 fn fetch_file_at(repo_path: &Path, sha: &str, file: &str) -> Option<String> {

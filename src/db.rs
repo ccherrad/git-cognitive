@@ -24,6 +24,10 @@ impl Database {
                 cognitive_friction_score REAL NOT NULL,
                 ai_attributed INTEGER NOT NULL,
                 attribution_pct REAL,
+                lines_changed INTEGER NOT NULL DEFAULT 0,
+                large_diff INTEGER NOT NULL DEFAULT 0,
+                session_duration_secs INTEGER,
+                fatigue INTEGER NOT NULL DEFAULT 0,
                 zombie INTEGER NOT NULL DEFAULT 0,
                 endorsement_status TEXT NOT NULL DEFAULT 'unendorsed',
                 audited_at TEXT NOT NULL
@@ -51,8 +55,9 @@ impl Database {
                 "INSERT INTO activity_items
                 (id, branch, classification, title, summary, commits_json,
                  since_sha, until_sha, cognitive_friction_score, ai_attributed,
-                 attribution_pct, zombie, endorsement_status, audited_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 attribution_pct, lines_changed, large_diff, session_duration_secs,
+                 fatigue, zombie, endorsement_status, audited_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
              ON CONFLICT(id) DO UPDATE SET
                 classification=excluded.classification,
                 title=excluded.title,
@@ -63,6 +68,10 @@ impl Database {
                 cognitive_friction_score=excluded.cognitive_friction_score,
                 ai_attributed=excluded.ai_attributed,
                 attribution_pct=excluded.attribution_pct,
+                lines_changed=excluded.lines_changed,
+                large_diff=excluded.large_diff,
+                session_duration_secs=excluded.session_duration_secs,
+                fatigue=excluded.fatigue,
                 zombie=excluded.zombie,
                 endorsement_status=excluded.endorsement_status,
                 audited_at=excluded.audited_at",
@@ -78,6 +87,10 @@ impl Database {
                     item.cognitive_friction_score,
                     item.ai_attributed as i64,
                     item.attribution_pct,
+                    item.lines_changed as i64,
+                    item.large_diff as i64,
+                    item.session_duration_secs.map(|v| v as i64),
+                    item.fatigue as i64,
                     item.zombie as i64,
                     item.endorsement_status.to_string(),
                     &item.audited_at,
@@ -122,7 +135,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, branch, classification, title, summary, commits_json,
                     since_sha, until_sha, cognitive_friction_score, ai_attributed,
-                    attribution_pct, zombie, endorsement_status, audited_at
+                    attribution_pct, lines_changed, large_diff, session_duration_secs,
+                    fatigue, zombie, endorsement_status, audited_at
              FROM activity_items ORDER BY audited_at DESC",
         )?;
 
@@ -141,8 +155,12 @@ impl Database {
                     row.get::<_, i64>(9)?,
                     row.get::<_, Option<f64>>(10)?,
                     row.get::<_, i64>(11)?,
-                    row.get::<_, String>(12)?,
-                    row.get::<_, String>(13)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
                 ))
             })?
             .map(|row| {
@@ -158,6 +176,10 @@ impl Database {
                     friction,
                     ai_attributed,
                     attribution_pct,
+                    lines_changed,
+                    large_diff,
+                    session_duration_secs,
+                    fatigue,
                     zombie,
                     endorsement_status,
                     audited_at,
@@ -195,6 +217,10 @@ impl Database {
                     cognitive_friction_score: friction as f32,
                     ai_attributed: ai_attributed != 0,
                     attribution_pct: attribution_pct.map(|v| v as f32),
+                    lines_changed: lines_changed as u32,
+                    large_diff: large_diff != 0,
+                    session_duration_secs: session_duration_secs.map(|v| v as u64),
+                    fatigue: fatigue != 0,
                     zombie: zombie != 0,
                     endorsement_status,
                     audited_at,
