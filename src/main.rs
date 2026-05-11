@@ -72,6 +72,9 @@ enum Commands {
         #[arg(help = "Agent to enable: claude")]
         agent: String,
     },
+
+    #[command(about = "Start the MCP server (JSON-RPC over stdio)")]
+    Mcp,
 }
 
 fn main() -> Result<()> {
@@ -122,6 +125,7 @@ fn main() -> Result<()> {
             "claude" => enable_claude()?,
             other => anyhow::bail!("Unknown agent '{}'. Supported: claude", other),
         },
+        Commands::Mcp => mcp_serve()?,
     }
 
     Ok(())
@@ -376,6 +380,217 @@ fn sync_pull() -> Result<()> {
         anyhow::bail!("Pull failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+fn mcp_serve() -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) if l.trim().is_empty() => continue,
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        let req: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = req["method"].as_str().unwrap_or("");
+
+        let response = match method {
+            "initialize" => mcp_ok(
+                id,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "git-cognitive", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            ),
+            "notifications/initialized" => continue,
+            "tools/list" => mcp_ok(
+                id,
+                serde_json::json!({
+                    "tools": [
+                        {
+                            "name": "debt",
+                            "description": "List all indexed commits with their cognitive friction score, AI attribution, classification, and endorsement status. Use this to get an overview of the repo's cognitive debt.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "filter": {
+                                        "type": "string",
+                                        "enum": ["all", "unendorsed", "risk", "zombie"],
+                                        "description": "Filter results. Default: all."
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "show",
+                            "description": "Get full details for a commit: classification, friction score, AI attribution percentage, summary, and endorsement history.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "sha": { "type": "string", "description": "Commit SHA or HEAD" }
+                                },
+                                "required": ["sha"]
+                            }
+                        },
+                        {
+                            "name": "endorse",
+                            "description": "Endorse a commit as understood and vouched for. Records the endorsement with the git user identity.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "sha": { "type": "string", "description": "Commit SHA or HEAD" }
+                                },
+                                "required": ["sha"]
+                            }
+                        }
+                    ]
+                }),
+            ),
+            "tools/call" => {
+                let name = req["params"]["name"].as_str().unwrap_or("");
+                let args = &req["params"]["arguments"];
+                match mcp_dispatch(name, args) {
+                    Ok(data) => mcp_ok(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&data).unwrap_or_default() }],
+                            "structuredContent": data
+                        }),
+                    ),
+                    Err(e) => mcp_err(id, -32000, &e.to_string()),
+                }
+            }
+            _ => mcp_err(id, -32601, "method not found"),
+        };
+
+        writeln!(out, "{}", serde_json::to_string(&response)?)?;
+        out.flush()?;
+    }
+
+    Ok(())
+}
+
+fn mcp_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn mcp_err(id: serde_json::Value, code: i32, msg: &str) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })
+}
+
+fn mcp_dispatch(name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+    match name {
+        "debt" => {
+            let filter = args["filter"].as_str().unwrap_or("all");
+            mcp_debt(filter)
+        }
+        "show" => {
+            let sha = args["sha"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing required argument: sha"))?;
+            let resolved = resolve_sha(sha)?;
+            mcp_show(&resolved)
+        }
+        "endorse" => {
+            let sha = args["sha"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing required argument: sha"))?;
+            let resolved = resolve_sha(sha)?;
+            do_endorse(&resolved)?;
+            Ok(serde_json::json!({ "sha": resolved, "status": "endorsed" }))
+        }
+        _ => anyhow::bail!("unknown tool: {}", name),
+    }
+}
+
+fn mcp_debt(filter: &str) -> Result<serde_json::Value> {
+    use cognitive_debt::{Classification, EndorsementStatus};
+
+    let db = db::Database::init()?;
+    let items = db.all_activity_items()?;
+
+    let visible: Vec<_> = items
+        .iter()
+        .filter(|i| !matches!(i.endorsement_status, EndorsementStatus::Excluded))
+        .filter(|i| match filter {
+            "unendorsed" => !matches!(i.endorsement_status, EndorsementStatus::Endorsed),
+            "risk" => matches!(i.classification, Classification::Risk),
+            "zombie" => i.zombie,
+            _ => true,
+        })
+        .map(|i| {
+            serde_json::json!({
+                "sha": i.id,
+                "branch": i.branch,
+                "title": i.title,
+                "classification": i.classification.to_string(),
+                "friction": i.cognitive_friction_score,
+                "ai_attributed": i.ai_attributed,
+                "attribution_pct": i.attribution_pct,
+                "zombie": i.zombie,
+                "status": i.endorsement_status.to_string(),
+                "audited_at": i.audited_at,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "items": visible,
+        "total": visible.len(),
+    }))
+}
+
+fn mcp_show(sha: &str) -> Result<serde_json::Value> {
+    let repo_path = PathBuf::from(".");
+
+    let item = cognitive_debt::read_activity_from_branch(&repo_path, sha)?;
+    let endorsements = cognitive_debt::read_endorsements_from_branch(&repo_path, sha)?;
+
+    match item {
+        None => Ok(serde_json::json!({
+            "error": "not_found",
+            "sha": sha,
+            "hint": format!("Run `git-cognitive index --commit {}` first.", &sha[..8.min(sha.len())])
+        })),
+        Some(item) => {
+            let endorsements_json: Vec<_> = endorsements
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "author": e.author,
+                        "status": e.status.to_string(),
+                        "timestamp": e.timestamp,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::json!({
+                "sha": item.id,
+                "branch": item.branch,
+                "title": item.title,
+                "summary": item.summary,
+                "classification": item.classification.to_string(),
+                "friction": item.cognitive_friction_score,
+                "ai_attributed": item.ai_attributed,
+                "attribution_pct": item.attribution_pct,
+                "zombie": item.zombie,
+                "status": item.endorsement_status.to_string(),
+                "audited_at": item.audited_at,
+                "endorsements": endorsements_json,
+            }))
+        }
+    }
 }
 
 fn enable_claude() -> Result<()> {

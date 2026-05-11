@@ -1,6 +1,6 @@
 [package]
 name = "git-cognitive"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["CHERRAD Charef <ccherrad@gmail.com>"]
 description = "Cognitive debt detection and management for Git repositories — audit, endorse, and surface AI-attributed risk"
