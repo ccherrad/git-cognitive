@@ -33,7 +33,8 @@ impl Database {
                 sha TEXT NOT NULL,
                 status TEXT NOT NULL,
                 author TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                reason TEXT
             );",
         )
         .context("Failed to create tables")?;
@@ -93,13 +94,14 @@ impl Database {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO endorsements (sha, status, author, timestamp)
-             VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO endorsements (sha, status, author, timestamp, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     &record.sha,
                     record.status.to_string(),
                     &record.author,
                     &record.timestamp,
+                    &record.reason,
                 ],
             )
             .context("Failed to insert endorsement")?;

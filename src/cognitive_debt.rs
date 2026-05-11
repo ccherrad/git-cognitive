@@ -77,6 +77,8 @@ pub struct EndorsementRecord {
     pub status: EndorsementStatus,
     pub author: String,
     pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 fn shard_path(id: &str) -> String {

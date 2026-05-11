@@ -41,6 +41,9 @@ enum Commands {
     Endorse {
         #[arg(help = "Commit SHA or HEAD (omit for interactive picker)")]
         sha: Option<String>,
+
+        #[arg(long, help = "One sentence explaining what this commit does")]
+        reason: Option<String>,
     },
 
     #[command(about = "Show cognitive debt — flat list of commits with friction and status")]
@@ -100,8 +103,8 @@ fn main() -> Result<()> {
                 check_zombies,
             )?;
         }
-        Commands::Endorse { sha } => {
-            endorse_command(sha.as_deref())?;
+        Commands::Endorse { sha, reason } => {
+            endorse_command(sha.as_deref(), reason.as_deref())?;
         }
         Commands::Debt { interactive } => {
             if interactive {
@@ -143,7 +146,7 @@ fn resolve_sha(sha: &str) -> Result<String> {
     }
 }
 
-fn do_endorse(sha: &str) -> Result<()> {
+fn do_endorse(sha: &str, reason: Option<&str>) -> Result<()> {
     use cognitive_debt::{DebtStore, EndorsementRecord, EndorsementStatus};
 
     let author = std::process::Command::new("git")
@@ -159,6 +162,7 @@ fn do_endorse(sha: &str) -> Result<()> {
         status: EndorsementStatus::Endorsed,
         author,
         timestamp: cognitive_debt::now_rfc3339(),
+        reason: reason.map(|s| s.to_string()),
     };
 
     store.write_endorsement(&record)?;
@@ -171,11 +175,15 @@ fn do_endorse(sha: &str) -> Result<()> {
     Ok(())
 }
 
-fn endorse_command(sha: Option<&str>) -> Result<()> {
+fn endorse_command(sha: Option<&str>, reason: Option<&str>) -> Result<()> {
     match sha {
         Some(s) => {
             let resolved = resolve_sha(s)?;
-            do_endorse(&resolved)
+            let reason = match reason {
+                Some(r) => Some(r.to_string()),
+                None => prompt_reason()?,
+            };
+            do_endorse(&resolved, reason.as_deref())
         }
         None => {
             loop {
@@ -190,11 +198,28 @@ fn endorse_command(sha: Option<&str>) -> Result<()> {
 
                 match picker::run_picker(picker_items)? {
                     None => break,
-                    Some(sha) => do_endorse(&sha)?,
+                    Some(sha) => {
+                        let reason = prompt_reason()?;
+                        do_endorse(&sha, reason.as_deref())?;
+                    }
                 }
             }
             Ok(())
         }
+    }
+}
+
+fn prompt_reason() -> Result<Option<String>> {
+    use std::io::Write;
+    print!("  reason (one sentence, or Enter to skip): ");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    let trimmed = buf.trim().to_string();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed))
     }
 }
 
@@ -237,6 +262,9 @@ fn show_command(sha: &str) -> Result<()> {
                 println!("  Endorsements ({}):", endorsements.len());
                 for e in &endorsements {
                     println!("    {}  {}  {}", e.timestamp, e.status, e.author);
+                    if let Some(r) = &e.reason {
+                        println!("      \"{}\"", r);
+                    }
                 }
             }
             println!();
@@ -260,7 +288,10 @@ fn debt_interactive() -> Result<()> {
 
         match picker::run_picker(picker_items)? {
             None => break,
-            Some(sha) => do_endorse(&sha)?,
+            Some(sha) => {
+                let reason = prompt_reason()?;
+                do_endorse(&sha, reason.as_deref())?;
+            }
         }
     }
 
@@ -445,11 +476,12 @@ fn mcp_serve() -> Result<()> {
                         },
                         {
                             "name": "endorse",
-                            "description": "Endorse a commit as understood and vouched for. Records the endorsement with the git user identity.",
+                            "description": "Endorse a commit as understood and vouched for. Records the endorsement with the git user identity. Provide a reason — one sentence explaining what the commit does. If you cannot write it, do not endorse.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "sha": { "type": "string", "description": "Commit SHA or HEAD" }
+                                    "sha": { "type": "string", "description": "Commit SHA or HEAD" },
+                                    "reason": { "type": "string", "description": "One sentence explaining what this commit does" }
                                 },
                                 "required": ["sha"]
                             }
@@ -506,9 +538,10 @@ fn mcp_dispatch(name: &str, args: &serde_json::Value) -> Result<serde_json::Valu
             let sha = args["sha"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing required argument: sha"))?;
+            let reason = args["reason"].as_str();
             let resolved = resolve_sha(sha)?;
-            do_endorse(&resolved)?;
-            Ok(serde_json::json!({ "sha": resolved, "status": "endorsed" }))
+            do_endorse(&resolved, reason)?;
+            Ok(serde_json::json!({ "sha": resolved, "status": "endorsed", "reason": reason }))
         }
         _ => anyhow::bail!("unknown tool: {}", name),
     }
