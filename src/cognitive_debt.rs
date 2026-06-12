@@ -5,59 +5,17 @@ use std::process::Command;
 
 const DEBT_BRANCH: &str = "cognitive/v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Classification {
-    NewFeature,
-    Refactor,
-    BugFix,
-    Minor,
-    Risk,
-    TechDebt,
-    DependencyUpdate,
-    Other,
-}
-
-impl std::fmt::Display for Classification {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Classification::NewFeature => "new_feature",
-            Classification::Refactor => "refactor",
-            Classification::BugFix => "bug_fix",
-            Classification::Minor => "minor",
-            Classification::Risk => "risk",
-            Classification::TechDebt => "tech_debt",
-            Classification::DependencyUpdate => "dependency_update",
-            Classification::Other => "other",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum EndorsementStatus {
-    Unendorsed,
-    Endorsed,
-    Excluded,
-}
-
-impl std::fmt::Display for EndorsementStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            EndorsementStatus::Unendorsed => "unendorsed",
-            EndorsementStatus::Endorsed => "endorsed",
-            EndorsementStatus::Excluded => "excluded",
-        };
-        write!(f, "{}", s)
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileHotspot {
+    pub file: String,
+    pub complexity: u32,
+    pub doc_gap: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivityItem {
+pub struct CommitAudit {
     pub id: String,
     pub branch: String,
-    pub classification: Classification,
     pub title: String,
     pub summary: String,
     pub commits: Vec<String>,
@@ -71,18 +29,8 @@ pub struct ActivityItem {
     pub session_duration_secs: Option<u64>,
     pub fatigue: bool,
     pub zombie: bool,
-    pub endorsement_status: EndorsementStatus,
     pub audited_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EndorsementRecord {
-    pub sha: String,
-    pub status: EndorsementStatus,
-    pub author: String,
-    pub timestamp: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub hotspots: Vec<FileHotspot>,
 }
 
 fn shard_path(id: &str) -> String {
@@ -99,7 +47,7 @@ fn shard_path(id: &str) -> String {
     format!("{}/{}/{}", a, b, rest)
 }
 
-pub fn read_activity_from_branch(repo_path: &Path, sha: &str) -> Result<Option<ActivityItem>> {
+pub fn read_commit_audit_from_branch(repo_path: &Path, sha: &str) -> Result<Option<CommitAudit>> {
     let shard = shard_path(sha);
     let git_path = format!("cognitive/v1:{}/activity.json", shard);
 
@@ -115,27 +63,6 @@ pub fn read_activity_from_branch(repo_path: &Path, sha: &str) -> Result<Option<A
 
     let item = serde_json::from_slice(&out.stdout).context("Failed to parse activity.json")?;
     Ok(Some(item))
-}
-
-pub fn read_endorsements_from_branch(
-    repo_path: &Path,
-    sha: &str,
-) -> Result<Vec<EndorsementRecord>> {
-    let shard = shard_path(sha);
-    let git_path = format!("cognitive/v1:{}/endorsements.json", shard);
-
-    let out = Command::new("git")
-        .current_dir(repo_path)
-        .args(["show", &git_path])
-        .output()
-        .context("Failed to run git show for endorsements")?;
-
-    if !out.status.success() {
-        return Ok(vec![]);
-    }
-
-    let records = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    Ok(records)
 }
 
 pub fn read_session_slice_from_branch(repo_path: &Path, sha: &str) -> Result<Vec<String>> {
@@ -286,7 +213,7 @@ impl DebtStore {
         })
     }
 
-    pub fn write_activity(&self, item: &ActivityItem) -> Result<()> {
+    pub fn write_audit(&self, item: &CommitAudit) -> Result<()> {
         let shard = shard_path(&item.id);
         let dir = self.worktree_path.join(&shard);
         std::fs::create_dir_all(&dir)
@@ -296,55 +223,6 @@ impl DebtStore {
         let json =
             serde_json::to_string_pretty(item).context("Failed to serialize activity item")?;
         std::fs::write(&activity_path, json).context("Failed to write activity.json")?;
-
-        let endorsements_path = dir.join("endorsements.json");
-        if !endorsements_path.exists() {
-            std::fs::write(&endorsements_path, "[]").context("Failed to init endorsements.json")?;
-        }
-
-        Ok(())
-    }
-
-    pub fn read_activity(&self, id: &str) -> Result<Option<ActivityItem>> {
-        let shard = shard_path(id);
-        let activity_path = self.worktree_path.join(&shard).join("activity.json");
-
-        if !activity_path.exists() {
-            return Ok(None);
-        }
-
-        let json =
-            std::fs::read_to_string(&activity_path).context("Failed to read activity.json")?;
-        let item = serde_json::from_str(&json).context("Failed to parse activity.json")?;
-        Ok(Some(item))
-    }
-
-    pub fn write_endorsement(&self, record: &EndorsementRecord) -> Result<()> {
-        let shard = shard_path(&record.sha);
-        let dir = self.worktree_path.join(&shard);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create shard dir {}", shard))?;
-
-        let endorsements_path = dir.join("endorsements.json");
-
-        let mut records: Vec<EndorsementRecord> = if endorsements_path.exists() {
-            let json = std::fs::read_to_string(&endorsements_path)
-                .context("Failed to read endorsements.json")?;
-            serde_json::from_str(&json).unwrap_or_default()
-        } else {
-            vec![]
-        };
-
-        records.push(record.clone());
-
-        let json =
-            serde_json::to_string_pretty(&records).context("Failed to serialize endorsements")?;
-        std::fs::write(&endorsements_path, json).context("Failed to write endorsements.json")?;
-
-        if let Ok(Some(mut item)) = self.read_activity(&record.sha) {
-            item.endorsement_status = record.status.clone();
-            self.write_activity(&item)?;
-        }
 
         Ok(())
     }
@@ -363,12 +241,6 @@ impl DebtStore {
             .context("Failed to write session.jsonl")?;
 
         Ok(())
-    }
-
-    pub fn read_all_activity(&self) -> Result<Vec<ActivityItem>> {
-        let mut items = Vec::new();
-        collect_activity_items(&self.worktree_path, &self.worktree_path, &mut items)?;
-        Ok(items)
     }
 
     pub fn commit(self) -> Result<()> {
@@ -421,33 +293,6 @@ impl DebtStore {
 
         Ok(())
     }
-}
-
-fn collect_activity_items(_base: &Path, dir: &Path, result: &mut Vec<ActivityItem>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("Failed to read dir {:?}", dir))? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        if name == ".git" {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_activity_items(_base, &path, result)?;
-        } else if name == "activity.json" {
-            let json = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {:?}", path))?;
-            if let Ok(item) = serde_json::from_str::<ActivityItem>(&json) {
-                result.push(item);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -515,24 +360,6 @@ mod tests {
         assert!(ts.contains('T'));
         assert!(ts.ends_with('Z'));
         assert_eq!(ts.len(), 20);
-    }
-
-    #[test]
-    fn classification_display() {
-        assert_eq!(Classification::NewFeature.to_string(), "new_feature");
-        assert_eq!(Classification::Risk.to_string(), "risk");
-        assert_eq!(Classification::TechDebt.to_string(), "tech_debt");
-        assert_eq!(
-            Classification::DependencyUpdate.to_string(),
-            "dependency_update"
-        );
-    }
-
-    #[test]
-    fn endorsement_status_display() {
-        assert_eq!(EndorsementStatus::Unendorsed.to_string(), "unendorsed");
-        assert_eq!(EndorsementStatus::Endorsed.to_string(), "endorsed");
-        assert_eq!(EndorsementStatus::Excluded.to_string(), "excluded");
     }
 }
 

@@ -1,7 +1,7 @@
+mod blame;
 mod cognitive_debt;
 mod db;
 mod index;
-mod picker;
 mod session;
 mod treesitter;
 
@@ -22,37 +22,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Index commits for cognitive debt")]
-    Index {
-        #[arg(long, help = "Index a specific commit SHA or HEAD")]
-        commit: Option<String>,
+    #[command(about = "Index the minimal set of commits covering the current repo state")]
+    Index,
 
-        #[arg(long, help = "Index all commits since this SHA")]
-        since: Option<String>,
-
-        #[arg(long, help = "Backfill all history (last 500 commits)")]
-        all: bool,
-
-        #[arg(long, help = "Scan for zombie AI commits (>30 days unendorsed)")]
-        check_zombies: bool,
+    #[command(about = "Interactive blame view with cognitive audit overlay")]
+    Blame {
+        #[arg(help = "File path to blame")]
+        file: String,
     },
 
-    #[command(about = "Endorse a commit as understood and vouched for")]
-    Endorse {
-        #[arg(help = "Commit SHA or HEAD (omit for interactive picker)")]
-        sha: Option<String>,
-
-        #[arg(long, help = "One sentence explaining what this commit does")]
-        reason: Option<String>,
-    },
-
-    #[command(about = "Show cognitive debt — flat list of commits with friction and status")]
-    Debt {
-        #[arg(long, help = "Open interactive picker to endorse items")]
-        interactive: bool,
-    },
-
-    #[command(about = "Show activity item details and endorsement history for a commit")]
+    #[command(about = "Show commit audit details")]
     Show {
         #[arg(help = "Commit SHA or HEAD")]
         sha: String,
@@ -84,34 +63,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index {
-            commit,
-            since,
-            all,
-            check_zombies,
-        } => {
+        Commands::Index => {
             let repo_path = PathBuf::from(".");
-            let since = if all {
-                Some("HEAD~500".to_string())
-            } else {
-                since
-            };
-            index::run_index(
-                &repo_path,
-                since.as_deref(),
-                commit.as_deref(),
-                check_zombies,
-            )?;
+            index::run_index(&repo_path)?;
         }
-        Commands::Endorse { sha, reason } => {
-            endorse_command(sha.as_deref(), reason.as_deref())?;
-        }
-        Commands::Debt { interactive } => {
-            if interactive {
-                debt_interactive()?;
-            } else {
-                debt_command()?;
-            }
+        Commands::Blame { file } => {
+            blame_command(&file)?;
         }
         Commands::Show { sha } => {
             let resolved = resolve_sha(&sha)?;
@@ -146,96 +103,15 @@ fn resolve_sha(sha: &str) -> Result<String> {
     }
 }
 
-fn do_endorse(sha: &str, reason: Option<&str>) -> Result<()> {
-    use cognitive_debt::{DebtStore, EndorsementRecord, EndorsementStatus};
-
-    let author = std::process::Command::new("git")
-        .args(["config", "user.email"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let repo_path = PathBuf::from(".");
-    let store = DebtStore::open(&repo_path)?;
-    let record = EndorsementRecord {
-        sha: sha.to_string(),
-        status: EndorsementStatus::Endorsed,
-        author,
-        timestamp: cognitive_debt::now_rfc3339(),
-        reason: reason.map(|s| s.to_string()),
-    };
-
-    store.write_endorsement(&record)?;
-    let db = db::Database::init()?;
-    db.insert_endorsement(&record)?;
-    store.commit()?;
-    sync_push().ok();
-
-    println!("Endorsed {}.", &sha[..8.min(sha.len())]);
-    Ok(())
-}
-
-fn endorse_command(sha: Option<&str>, reason: Option<&str>) -> Result<()> {
-    match sha {
-        Some(s) => {
-            let resolved = resolve_sha(s)?;
-            let reason = match reason {
-                Some(r) => Some(r.to_string()),
-                None => prompt_reason()?,
-            };
-            do_endorse(&resolved, reason.as_deref())
-        }
-        None => {
-            loop {
-                let db = db::Database::init()?;
-                let items = db.all_activity_items()?;
-                let picker_items = picker::build_picker_items(&items, true);
-
-                if picker_items.is_empty() {
-                    println!("No unendorsed items remaining.");
-                    break;
-                }
-
-                match picker::run_picker(picker_items)? {
-                    None => break,
-                    Some(sha) => {
-                        let reason = prompt_reason()?;
-                        do_endorse(&sha, reason.as_deref())?;
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn prompt_reason() -> Result<Option<String>> {
-    use std::io::Write;
-    print!("  reason (one sentence, or Enter to skip): ");
-    std::io::stdout().flush()?;
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
-    let trimmed = buf.trim().to_string();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed))
-    }
-}
-
 fn show_command(sha: &str) -> Result<()> {
     let repo_path = PathBuf::from(".");
 
-    let item = cognitive_debt::read_activity_from_branch(&repo_path, sha)?;
-    let endorsements = cognitive_debt::read_endorsements_from_branch(&repo_path, sha)?;
+    let item = cognitive_debt::read_commit_audit_from_branch(&repo_path, sha)?;
 
     match item {
         None => {
-            println!("No activity item found for {}.", &sha[..8.min(sha.len())]);
-            println!(
-                "Run `git-cognitive index --commit {}` first.",
-                &sha[..8.min(sha.len())]
-            );
+            println!("No audit found for {}.", &sha[..8.min(sha.len())]);
+            println!("Run `git-cognitive index` first.");
         }
         Some(item) => {
             println!();
@@ -246,7 +122,6 @@ fn show_command(sha: &str) -> Result<()> {
                 println!("  summary  {}", item.summary);
             }
             println!();
-            println!("  class    {}", item.classification);
             println!("  friction {:.2}", item.cognitive_friction_score);
             if let Some(pct) = item.attribution_pct {
                 println!("  agent    {:.0}%", pct * 100.0);
@@ -262,19 +137,15 @@ fn show_command(sha: &str) -> Result<()> {
                 println!("  fatigue  yes (commit after 3h+ session)");
             }
             println!("  zombie   {}", if item.zombie { "yes" } else { "no" });
-            println!("  status   {}", item.endorsement_status);
             println!("  audited  {}", item.audited_at);
-            println!();
-
-            if endorsements.is_empty() {
-                println!("  No endorsements yet.");
-            } else {
-                println!("  Endorsements ({}):", endorsements.len());
-                for e in &endorsements {
-                    println!("    {}  {}  {}", e.timestamp, e.status, e.author);
-                    if let Some(r) = &e.reason {
-                        println!("      \"{}\"", r);
-                    }
+            if !item.hotspots.is_empty() {
+                println!();
+                println!("  hotspots:");
+                for h in &item.hotspots {
+                    println!(
+                        "    {:<50} complexity {:>3}  doc_gap {:.2}",
+                        h.file, h.complexity, h.doc_gap
+                    );
                 }
             }
             println!();
@@ -284,114 +155,12 @@ fn show_command(sha: &str) -> Result<()> {
     Ok(())
 }
 
-fn debt_interactive() -> Result<()> {
-    loop {
-        let db = db::Database::init().context("Failed to initialize database")?;
-        let items = db.all_activity_items()?;
-
-        if items.is_empty() {
-            println!("No activity items. Run `git-cognitive index` first.");
-            break;
-        }
-
-        let picker_items = picker::build_picker_items(&items, false);
-
-        match picker::run_picker(picker_items)? {
-            None => break,
-            Some(sha) => {
-                let reason = prompt_reason()?;
-                do_endorse(&sha, reason.as_deref())?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn debt_command() -> Result<()> {
-    use cognitive_debt::{Classification, EndorsementStatus};
-
+fn blame_command(file: &str) -> Result<()> {
     let db = db::Database::init().context("Failed to initialize database")?;
-    let items = db
-        .all_activity_items()
-        .context("Failed to load activity items")?;
-
-    if items.is_empty() {
-        println!("No activity items found. Run `git-cognitive index` first.");
-        return Ok(());
-    }
-
-    let visible: Vec<_> = items
-        .iter()
-        .filter(|i| !matches!(i.endorsement_status, EndorsementStatus::Excluded))
-        .collect();
-
-    println!(
-        "\n{:<10} {:<12} {:<10} {:<8} {:<59} STATUS",
-        "COMMIT", "CLASS", "FRICTION", "AI", "TITLE"
-    );
-    println!("{}", "-".repeat(105));
-
-    for item in &visible {
-        let status = if item.zombie {
-            "\x1B[31mZOMBIE\x1B[0m"
-        } else {
-            match item.endorsement_status {
-                EndorsementStatus::Endorsed => "\x1B[32mendorsed\x1B[0m",
-                _ => "\x1B[31munendorsed\x1B[0m",
-            }
-        };
-
-        let ai = item
-            .attribution_pct
-            .map(|p| format!("{:3.0}%", p * 100.0))
-            .unwrap_or_else(|| {
-                if item.ai_attributed {
-                    " ai ".to_string()
-                } else {
-                    "    ".to_string()
-                }
-            });
-
-        println!(
-            "{:<10} {:<12} {:<10} {:<8} {:<59} {}",
-            &item.id[..8.min(item.id.len())],
-            &item.classification.to_string()[..12.min(item.classification.to_string().len())],
-            format!("{:.2}", item.cognitive_friction_score),
-            ai,
-            &item.title[..59.min(item.title.len())],
-            status,
-        );
-    }
-
-    println!();
-
-    let risk_items: Vec<_> = visible
-        .iter()
-        .filter(|i| {
-            matches!(i.classification, Classification::Risk)
-                && !matches!(i.endorsement_status, EndorsementStatus::Endorsed)
-        })
-        .collect();
-
-    if !risk_items.is_empty() {
-        println!("  {} unendorsed RISK item(s):", risk_items.len());
-        for item in risk_items.iter().take(5) {
-            println!("   {} {}", &item.id[..8.min(item.id.len())], item.title);
-        }
-        println!();
-    }
-
-    let zombie_items: Vec<_> = visible.iter().filter(|i| i.zombie).collect();
-    if !zombie_items.is_empty() {
-        println!("  {} zombie(s) detected:", zombie_items.len());
-        for item in zombie_items.iter().take(5) {
-            println!("   {} {}", &item.id[..8.min(item.id.len())], item.title);
-        }
-        println!();
-    }
-
-    Ok(())
+    let audits = db
+        .all_commit_audits()
+        .context("Failed to load commit audits")?;
+    blame::run_blame(file, &audits)
 }
 
 fn sync_push() -> Result<()> {
@@ -415,7 +184,7 @@ fn sync_pull() -> Result<()> {
         .context("Failed to run git fetch")?;
     if out.status.success() {
         println!("Pulled cognitive/v1 from origin.");
-        println!("Run `git-cognitive debt` to see the updated state.");
+        println!("Run `git-cognitive blame <file>` to inspect the updated state.");
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("Pull failed: {}", stderr.trim());
@@ -460,22 +229,8 @@ fn mcp_serve() -> Result<()> {
                 serde_json::json!({
                     "tools": [
                         {
-                            "name": "debt",
-                            "description": "List all indexed commits with their cognitive friction score, AI attribution, classification, and endorsement status. Use this to get an overview of the repo's cognitive debt.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "filter": {
-                                        "type": "string",
-                                        "enum": ["all", "unendorsed", "risk", "zombie"],
-                                        "description": "Filter results. Default: all."
-                                    }
-                                }
-                            }
-                        },
-                        {
                             "name": "show",
-                            "description": "Get full details for a commit: classification, friction score, AI attribution percentage, summary, and endorsement history.",
+                            "description": "Get full details for a commit: friction score, AI attribution, hotspots, and session info.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -485,15 +240,14 @@ fn mcp_serve() -> Result<()> {
                             }
                         },
                         {
-                            "name": "endorse",
-                            "description": "Endorse a commit as understood and vouched for. Records the endorsement with the git user identity. Provide a reason — one sentence explaining what the commit does. If you cannot write it, do not endorse.",
+                            "name": "blame",
+                            "description": "Return every line of a file with its last-touching commit SHA and cognitive audit data (friction, AI attribution, zombie flag). Use this to identify which lines carry the most cognitive risk.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "sha": { "type": "string", "description": "Commit SHA or HEAD" },
-                                    "reason": { "type": "string", "description": "One sentence explaining what this commit does" }
+                                    "file": { "type": "string", "description": "File path relative to repo root" }
                                 },
-                                "required": ["sha"]
+                                "required": ["file"]
                             }
                         }
                     ]
@@ -533,10 +287,6 @@ fn mcp_err(id: serde_json::Value, code: i32, msg: &str) -> serde_json::Value {
 
 fn mcp_dispatch(name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
     match name {
-        "debt" => {
-            let filter = args["filter"].as_str().unwrap_or("all");
-            mcp_debt(filter)
-        }
         "show" => {
             let sha = args["sha"]
                 .as_str()
@@ -544,80 +294,95 @@ fn mcp_dispatch(name: &str, args: &serde_json::Value) -> Result<serde_json::Valu
             let resolved = resolve_sha(sha)?;
             mcp_show(&resolved)
         }
-        "endorse" => {
-            let sha = args["sha"]
+        "blame" => {
+            let file = args["file"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing required argument: sha"))?;
-            let reason = args["reason"].as_str();
-            let resolved = resolve_sha(sha)?;
-            do_endorse(&resolved, reason)?;
-            Ok(serde_json::json!({ "sha": resolved, "status": "endorsed", "reason": reason }))
+                .ok_or_else(|| anyhow::anyhow!("missing required argument: file"))?;
+            mcp_blame(file)
         }
         _ => anyhow::bail!("unknown tool: {}", name),
     }
 }
 
-fn mcp_debt(filter: &str) -> Result<serde_json::Value> {
-    use cognitive_debt::{Classification, EndorsementStatus};
-
+fn mcp_blame(file: &str) -> Result<serde_json::Value> {
     let db = db::Database::init()?;
-    let items = db.all_activity_items()?;
+    let audits = db.all_commit_audits()?;
 
-    let visible: Vec<_> = items
+    let audit_map: std::collections::HashMap<String, &cognitive_debt::CommitAudit> = audits
         .iter()
-        .filter(|i| !matches!(i.endorsement_status, EndorsementStatus::Excluded))
-        .filter(|i| match filter {
-            "unendorsed" => !matches!(i.endorsement_status, EndorsementStatus::Endorsed),
-            "risk" => matches!(i.classification, Classification::Risk),
-            "zombie" => i.zombie,
-            _ => true,
-        })
-        .map(|i| {
-            serde_json::json!({
-                "sha": i.id,
-                "branch": i.branch,
-                "title": i.title,
-                "classification": i.classification.to_string(),
-                "friction": i.cognitive_friction_score,
-                "ai_attributed": i.ai_attributed,
-                "attribution_pct": i.attribution_pct,
-                "lines_changed": i.lines_changed,
-                "large_diff": i.large_diff,
-                "session_duration_secs": i.session_duration_secs,
-                "fatigue": i.fatigue,
-                "zombie": i.zombie,
-                "status": i.endorsement_status.to_string(),
-                "audited_at": i.audited_at,
-            })
+        .flat_map(|a| {
+            let key8 = a.id[..8.min(a.id.len())].to_string();
+            vec![(a.id.clone(), a), (key8, a)]
         })
         .collect();
 
+    let out = std::process::Command::new("git")
+        .args(["blame", "--porcelain", file])
+        .output()
+        .context("Failed to run git blame")?;
+
+    if !out.status.success() {
+        anyhow::bail!(
+            "git blame failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = Vec::new();
+    let mut line_no = 0usize;
+    let mut current_sha = String::new();
+
+    for raw in text.lines() {
+        if let Some(stripped) = raw.strip_prefix('\t') {
+            line_no += 1;
+            let short = current_sha[..8.min(current_sha.len())].to_string();
+            let audit = audit_map
+                .get(&current_sha)
+                .or_else(|| audit_map.get(&short));
+            lines.push(serde_json::json!({
+                "line_no": line_no,
+                "sha": &current_sha,
+                "content": stripped,
+                "friction": audit.map(|a| a.cognitive_friction_score),
+                "ai_attributed": audit.map(|a| a.ai_attributed),
+                "attribution_pct": audit.and_then(|a| a.attribution_pct),
+                "zombie": audit.map(|a| a.zombie),
+            }));
+        } else {
+            let parts: Vec<&str> = raw.splitn(4, ' ').collect();
+            if parts.len() >= 3 && parts[0].len() == 40 {
+                current_sha = parts[0].to_string();
+            }
+        }
+    }
+
     Ok(serde_json::json!({
-        "items": visible,
-        "total": visible.len(),
+        "file": file,
+        "lines": lines,
     }))
 }
 
 fn mcp_show(sha: &str) -> Result<serde_json::Value> {
     let repo_path = PathBuf::from(".");
 
-    let item = cognitive_debt::read_activity_from_branch(&repo_path, sha)?;
-    let endorsements = cognitive_debt::read_endorsements_from_branch(&repo_path, sha)?;
+    let item = cognitive_debt::read_commit_audit_from_branch(&repo_path, sha)?;
 
     match item {
         None => Ok(serde_json::json!({
             "error": "not_found",
             "sha": sha,
-            "hint": format!("Run `git-cognitive index --commit {}` first.", &sha[..8.min(sha.len())])
+            "hint": "Run `git-cognitive index` first."
         })),
         Some(item) => {
-            let endorsements_json: Vec<_> = endorsements
+            let hotspots_json: Vec<_> = item
+                .hotspots
                 .iter()
-                .map(|e| {
+                .map(|h| {
                     serde_json::json!({
-                        "author": e.author,
-                        "status": e.status.to_string(),
-                        "timestamp": e.timestamp,
+                        "file": h.file,
+                        "complexity": h.complexity,
+                        "doc_gap": h.doc_gap,
                     })
                 })
                 .collect();
@@ -627,7 +392,6 @@ fn mcp_show(sha: &str) -> Result<serde_json::Value> {
                 "branch": item.branch,
                 "title": item.title,
                 "summary": item.summary,
-                "classification": item.classification.to_string(),
                 "friction": item.cognitive_friction_score,
                 "ai_attributed": item.ai_attributed,
                 "attribution_pct": item.attribution_pct,
@@ -636,9 +400,8 @@ fn mcp_show(sha: &str) -> Result<serde_json::Value> {
                 "session_duration_secs": item.session_duration_secs,
                 "fatigue": item.fatigue,
                 "zombie": item.zombie,
-                "status": item.endorsement_status.to_string(),
                 "audited_at": item.audited_at,
-                "endorsements": endorsements_json,
+                "hotspots": hotspots_json,
             }))
         }
     }
@@ -652,7 +415,7 @@ fn enable_claude() -> Result<()> {
 
     // --- post-commit hook ---
     let post_commit = git_hooks_dir.join("post-commit");
-    let post_commit_script = "#!/bin/sh\nsleep 2\ngit-cognitive index --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
+    let post_commit_script = "#!/bin/sh\nsleep 2\ngit-cognitive index 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
 
     let should_write = if post_commit.exists() {
         let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
@@ -665,7 +428,7 @@ fn enable_claude() -> Result<()> {
         if post_commit.exists() {
             let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
             let appended = format!(
-                "{}\n# git-cognitive cognitive debt index\nsleep 2\ngit-cognitive index --commit HEAD 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
+                "{}\n# git-cognitive\nsleep 2\ngit-cognitive index 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
                 existing.trim()
             );
             std::fs::write(&post_commit, appended)?;

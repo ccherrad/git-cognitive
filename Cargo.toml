@@ -3,10 +3,10 @@ name = "git-cognitive"
 version = "0.2.3"
 edition = "2021"
 authors = ["CHERRAD Charef <ccherrad@gmail.com>"]
-description = "Cognitive debt detection and management for Git repositories — audit, endorse, and surface AI-attributed risk"
+description = "Cognitive debt detection and management for Git repositories — audit and surface AI-attributed risk"
 repository = "https://github.com/ccherrad/git-cognitive"
 license = "MIT OR Apache-2.0"
-keywords = ["git", "cognitive-debt", "ai-attribution", "endorsement", "code-review"]
+keywords = ["git", "cognitive-debt", "ai-attribution", "code-review", "friction"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     ".git/",
@@ -21,10 +21,16 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 crossterm = "0.28"
-indicatif = "0.17"
 
-git-topology = "0.1.2"
 tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
 
 [[bin]]
 name = "git-cognitive"

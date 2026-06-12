@@ -15,7 +15,6 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS activity_items (
                 id TEXT PRIMARY KEY,
                 branch TEXT NOT NULL,
-                classification TEXT NOT NULL,
                 title TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 commits_json TEXT NOT NULL,
@@ -29,37 +28,31 @@ impl Database {
                 session_duration_secs INTEGER,
                 fatigue INTEGER NOT NULL DEFAULT 0,
                 zombie INTEGER NOT NULL DEFAULT 0,
-                endorsement_status TEXT NOT NULL DEFAULT 'unendorsed',
-                audited_at TEXT NOT NULL
+                audited_at TEXT NOT NULL,
+                hotspots_json TEXT NOT NULL DEFAULT '[]'
             );
-            CREATE TABLE IF NOT EXISTS endorsements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sha TEXT NOT NULL,
-                status TEXT NOT NULL,
-                author TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                reason TEXT
-            );",
+",
         )
         .context("Failed to create tables")?;
 
         Ok(Database { conn })
     }
 
-    pub fn upsert_activity_item(&self, item: &crate::cognitive_debt::ActivityItem) -> Result<()> {
+    pub fn upsert_commit_audit(&self, item: &crate::cognitive_debt::CommitAudit) -> Result<()> {
         let commits_json =
             serde_json::to_string(&item.commits).context("Failed to serialize commits")?;
+        let hotspots_json =
+            serde_json::to_string(&item.hotspots).context("Failed to serialize hotspots")?;
 
         self.conn
             .execute(
                 "INSERT INTO activity_items
-                (id, branch, classification, title, summary, commits_json,
+                (id, branch, title, summary, commits_json,
                  since_sha, until_sha, cognitive_friction_score, ai_attributed,
                  attribution_pct, lines_changed, large_diff, session_duration_secs,
-                 fatigue, zombie, endorsement_status, audited_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                 fatigue, zombie, audited_at, hotspots_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
              ON CONFLICT(id) DO UPDATE SET
-                classification=excluded.classification,
                 title=excluded.title,
                 summary=excluded.summary,
                 commits_json=excluded.commits_json,
@@ -73,12 +66,11 @@ impl Database {
                 session_duration_secs=excluded.session_duration_secs,
                 fatigue=excluded.fatigue,
                 zombie=excluded.zombie,
-                endorsement_status=excluded.endorsement_status,
-                audited_at=excluded.audited_at",
+                audited_at=excluded.audited_at,
+                hotspots_json=excluded.hotspots_json",
                 params![
                     &item.id,
                     &item.branch,
-                    item.classification.to_string(),
                     &item.title,
                     &item.summary,
                     &commits_json,
@@ -92,8 +84,8 @@ impl Database {
                     item.session_duration_secs.map(|v| v as i64),
                     item.fatigue as i64,
                     item.zombie as i64,
-                    item.endorsement_status.to_string(),
                     &item.audited_at,
+                    &hotspots_json,
                 ],
             )
             .context("Failed to upsert activity item")?;
@@ -101,42 +93,14 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_endorsement(
-        &self,
-        record: &crate::cognitive_debt::EndorsementRecord,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO endorsements (sha, status, author, timestamp, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    &record.sha,
-                    record.status.to_string(),
-                    &record.author,
-                    &record.timestamp,
-                    &record.reason,
-                ],
-            )
-            .context("Failed to insert endorsement")?;
-
-        self.conn
-            .execute(
-                "UPDATE activity_items SET endorsement_status = ?1 WHERE id = ?2",
-                params![record.status.to_string(), &record.sha],
-            )
-            .context("Failed to update endorsement status on activity item")?;
-
-        Ok(())
-    }
-
-    pub fn all_activity_items(&self) -> Result<Vec<crate::cognitive_debt::ActivityItem>> {
-        use crate::cognitive_debt::{ActivityItem, Classification, EndorsementStatus};
+    pub fn all_commit_audits(&self) -> Result<Vec<crate::cognitive_debt::CommitAudit>> {
+        use crate::cognitive_debt::{CommitAudit, FileHotspot};
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, branch, classification, title, summary, commits_json,
+            "SELECT id, branch, title, summary, commits_json,
                     since_sha, until_sha, cognitive_friction_score, ai_attributed,
                     attribution_pct, lines_changed, large_diff, session_duration_secs,
-                    fatigue, zombie, endorsement_status, audited_at
+                    fatigue, zombie, audited_at, hotspots_json
              FROM activity_items ORDER BY audited_at DESC",
         )?;
 
@@ -150,24 +114,22 @@ impl Database {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, f64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, Option<f64>>(10)?,
+                    row.get::<_, f64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, i64>(13)?,
                     row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
+                    row.get::<_, String>(15)?,
                     row.get::<_, String>(16)?,
-                    row.get::<_, String>(17)?,
                 ))
             })?
             .map(|row| {
                 let (
                     id,
                     branch,
-                    classification,
                     title,
                     summary,
                     commits_json,
@@ -181,34 +143,19 @@ impl Database {
                     session_duration_secs,
                     fatigue,
                     zombie,
-                    endorsement_status,
                     audited_at,
+                    hotspots_json,
                 ) = row?;
 
                 let commits: Vec<String> = serde_json::from_str(&commits_json)
                     .map_err(|e| anyhow::anyhow!("Failed to parse commits: {}", e))?;
 
-                let classification = match classification.as_str() {
-                    "new_feature" => Classification::NewFeature,
-                    "refactor" => Classification::Refactor,
-                    "bug_fix" => Classification::BugFix,
-                    "minor" => Classification::Minor,
-                    "risk" => Classification::Risk,
-                    "tech_debt" => Classification::TechDebt,
-                    "dependency_update" => Classification::DependencyUpdate,
-                    _ => Classification::Other,
-                };
+                let hotspots: Vec<FileHotspot> =
+                    serde_json::from_str(&hotspots_json).unwrap_or_default();
 
-                let endorsement_status = match endorsement_status.as_str() {
-                    "endorsed" => EndorsementStatus::Endorsed,
-                    "excluded" => EndorsementStatus::Excluded,
-                    _ => EndorsementStatus::Unendorsed,
-                };
-
-                Ok(ActivityItem {
+                Ok(CommitAudit {
                     id,
                     branch,
-                    classification,
                     title,
                     summary,
                     commits,
@@ -222,8 +169,8 @@ impl Database {
                     session_duration_secs: session_duration_secs.map(|v| v as u64),
                     fatigue: fatigue != 0,
                     zombie: zombie != 0,
-                    endorsement_status,
                     audited_at,
+                    hotspots,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

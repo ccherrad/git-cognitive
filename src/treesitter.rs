@@ -1,10 +1,48 @@
 use tree_sitter::Node;
 
-pub use git_topology::chunking::languages::{detect_language, SupportedLanguage};
-use git_topology::chunking::parse;
+#[derive(Clone, Copy, Debug)]
+pub enum SupportedLanguage {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Go,
+    Java,
+    C,
+    Cpp,
+}
 
-/// Cyclomatic complexity: count decision points in the AST.
-/// Each if, else if, for, while, loop, match arm, && / || adds 1.
+pub fn detect_language(path: &str) -> Option<SupportedLanguage> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    match ext {
+        "rs" => Some(SupportedLanguage::Rust),
+        "py" => Some(SupportedLanguage::Python),
+        "js" | "mjs" | "cjs" => Some(SupportedLanguage::JavaScript),
+        "ts" | "tsx" => Some(SupportedLanguage::TypeScript),
+        "go" => Some(SupportedLanguage::Go),
+        "java" => Some(SupportedLanguage::Java),
+        "c" | "h" => Some(SupportedLanguage::C),
+        "cpp" | "cc" | "cxx" | "hpp" => Some(SupportedLanguage::Cpp),
+        _ => None,
+    }
+}
+
+pub fn parse(src: &str, lang: SupportedLanguage) -> Option<tree_sitter::Tree> {
+    let ts_lang = match lang {
+        SupportedLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+        SupportedLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+        SupportedLanguage::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        SupportedLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        SupportedLanguage::Go => tree_sitter_go::LANGUAGE.into(),
+        SupportedLanguage::Java => tree_sitter_java::LANGUAGE.into(),
+        SupportedLanguage::C => tree_sitter_c::LANGUAGE.into(),
+        SupportedLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_lang).ok()?;
+    parser.parse(src, None)
+}
+
 fn cyclomatic_complexity(src: &str, tree: &tree_sitter::Tree) -> usize {
     let mut count = 0usize;
     let mut cursor = tree.walk();
@@ -66,8 +104,6 @@ const FUNCTION_NODE_TYPES: &[&str] = &[
 const DOC_COMMENT_NODE_TYPES: &[&str] =
     &["line_comment", "block_comment", "doc_comment", "comment"];
 
-/// Doc gap: ratio of functions added without a preceding doc comment.
-/// Returns 0.0 (fully documented) to 1.0 (nothing documented).
 fn doc_gap(tree: &tree_sitter::Tree) -> f32 {
     let mut total_fns = 0usize;
     let mut undocumented = 0usize;
@@ -113,28 +149,13 @@ fn doc_gap(tree: &tree_sitter::Tree) -> f32 {
     }
 }
 
-/// Compute complexity delta between old and new source.
-/// Returns a 0.0–1.0 score: ratio of complexity added vs total complexity.
-pub fn complexity_delta(old_src: &str, new_src: &str, lang: &SupportedLanguage) -> f32 {
-    let old_tree = parse(old_src, *lang);
-    let new_tree = parse(new_src, *lang);
-
-    let old_complexity = old_tree
+pub fn absolute_complexity(src: &str, lang: &SupportedLanguage) -> u32 {
+    parse(src, *lang)
         .as_ref()
-        .map(|t| cyclomatic_complexity(old_src, t))
-        .unwrap_or(0);
-    let new_complexity = new_tree
-        .as_ref()
-        .map(|t| cyclomatic_complexity(new_src, t))
-        .unwrap_or(0);
-
-    let added = new_complexity.saturating_sub(old_complexity);
-    let total = new_complexity.max(1);
-    (added as f32 / total as f32).clamp(0.0, 1.0)
+        .map(|t| cyclomatic_complexity(src, t) as u32)
+        .unwrap_or(0)
 }
 
-/// Compute doc gap score for new source only.
-/// Returns 0.0 (all documented) to 1.0 (nothing documented).
 pub fn doc_gap_score(new_src: &str, lang: &SupportedLanguage) -> f32 {
     parse(new_src, *lang).as_ref().map(doc_gap).unwrap_or(0.0)
 }
