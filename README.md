@@ -13,38 +13,39 @@ AI coding agents ship code fast. Humans lose track of what was AI-generated and 
 
 ## How it works
 
-Every `git commit` automatically:
-1. Slices the active Claude Code session to the window between this commit and the previous one
-2. Attributes AI lines by matching agent Write/Edit tool calls against the commit diff
-3. Scores friction via tree-sitter AST analysis (complexity delta, doc gap, author churn)
-4. Classifies the commit and writes to the `cognitive/v1` orphan branch
+`git-cognitive index` finds the minimal set of commits that covers the current state of your repo — the last commit that touched each tracked file — and builds a `CommitAudit` for each one:
 
-Each commit gets three files stored in a sharded orphan branch:
+1. Attributes AI lines by matching Claude session tool calls against the commit diff
+2. Scores friction via tree-sitter AST analysis (complexity, doc gap, author churn)
+3. Stores results in SQLite (`.git/cognitive.db`) and the `cognitive/v1` orphan branch
+
+Each commit gets two files in a sharded orphan branch:
 
 ```
 cognitive/v1
-└── ab/cd/ef1234/
-    ├── activity.json     — classification, friction score, AI attribution, endorsement status
-    ├── endorsements.json — who endorsed it and when
-    └── session.jsonl     — the Claude conversation that produced this commit
+└── ab/cd/ef/
+    ├── activity.json   — friction score, AI attribution, hotspots, zombie flag
+    └── session.jsonl   — the Claude conversation that produced this commit
 ```
 
 No external service. No daemon. Everything in git.
 
 ## Friction score
 
-Three signals, weighted sum (0.0–1.0):
+Four signals, weighted sum (0.0–1.0):
 
-- **Complexity delta (0.4)** — real decision points added (`if`, `match arm`, `&&`, `||`, etc.) parsed via tree-sitter AST
-- **Doc gap (0.4)** — functions added without a doc comment node in the AST
+- **Complexity (0.4)** — max cyclomatic complexity across changed files, parsed via tree-sitter AST
+- **Doc gap (0.4)** — ratio of undocumented functions in changed files
 - **Author churn (0.2)** — distinct committers on changed files in the last 90 days
+- **+0.15** if large diff (AI-attributed and >100 lines)
+- **+0.20** if fatigue (AI-attributed commit after 3h+ session)
 
 ## AI attribution
 
 Checked in priority order:
 
 1. `Agent-Attribution: 75%` trailer in the commit message — exact percentage
-2. Line-level matching — agent Write/Edit lines vs git diff lines, per file
+2. Line-level matching — agent Write/Edit tool calls vs git diff lines, per file
 3. Keyword scan — `Co-Authored-By: Claude`, `co-authored-by: copilot`, `cursor`, `ai-generated`
 
 ## Install
@@ -64,14 +65,14 @@ cargo install --path .
 ## Quickstart
 
 ```sh
-# 1. Enable automatic auditing on every commit
+# 1. Enable automatic indexing on every commit
 git-cognitive enable claude
 
-# 2. See the debt
-git-cognitive debt
+# 2. Index the current repo state
+git-cognitive index
 
-# 3. Endorse commits interactively
-git-cognitive endorse
+# 3. Inspect a file with cognitive overlay
+git-cognitive blame src/main.rs
 
 # 4. Share with your team
 git-cognitive push
@@ -85,37 +86,29 @@ git-cognitive push
 git-cognitive enable claude
 ```
 
-Writes `.git/hooks/post-commit` to auto-audit and push on every commit.
+Writes `.git/hooks/post-commit` to auto-index and push on every commit.
 
 ### `index`
 
 ```
-git-cognitive index [--commit <SHA>|HEAD] [--since <SHA>] [--all] [--check-zombies]
+git-cognitive index
 ```
 
-Walks commits and writes activity to `cognitive/v1`. Run manually to backfill history.
+Finds the minimal covering set of commits for the current repo state: `git ls-files` → last-touching SHA per file → dedup → skip already-indexed. Idempotent — safe to run repeatedly.
 
-- `--all` — backfill last 500 commits
-- `--check-zombies` — flag AI commits unendorsed >30 days with no human follow-up
-
-### `debt`
+### `blame`
 
 ```
-git-cognitive debt [--interactive]
+git-cognitive blame <file>
 ```
 
-Flat table of all commits: SHA, classification, friction score, AI%, title, endorsement status.
+Interactive TUI showing git blame output with cognitive audit data overlaid per line:
 
-### `endorse`
+- Friction score bar (green → yellow → red)
+- AI attribution %
+- Zombie flag ☠
 
-```
-git-cognitive endorse [<SHA>|HEAD]
-git-cognitive endorse          # interactive TUI picker
-```
-
-Mark a commit as understood and vouched for. Pushes automatically.
-
-TUI controls: `↑↓`/`jk` navigate, `e`/Enter endorse, `s` git show, `q` quit.
+Controls: `↑↓`/`jk` navigate, `Enter` drill into full audit detail, `q` quit.
 
 ### `show`
 
@@ -123,7 +116,7 @@ TUI controls: `↑↓`/`jk` navigate, `e`/Enter endorse, `s` git show, `q` quit.
 git-cognitive show <SHA>|HEAD
 ```
 
-Full activity item + endorsement history for a commit.
+Full audit detail for a commit: friction score, AI attribution, lines changed, session duration, fatigue flag, zombie flag, and per-file hotspots (complexity + doc gap).
 
 ### `session`
 
@@ -142,28 +135,20 @@ git-cognitive pull
 
 Share cognitive debt data with your team via the `cognitive/v1` branch.
 
-## Classifications
+### `mcp`
 
-| Class | Trigger |
-|---|---|
-| `risk` | AI-attributed + files in a semantic cluster (topology index), or AI ≥70% + feat |
-| `tech_debt` | AI ≥70% + refactor/chore |
-| `new_feature` | `feat:`, `add:`, `new:` + low AI |
-| `bug_fix` | `fix:`, `bug:` |
-| `refactor` | `refactor:`, `chore:` + low AI |
-| `dependency_update` | `Cargo.lock`, `yarn.lock`, etc. — auto-excluded from endorsement queue |
-| `minor` | `docs:`, `test:`, `ci:`, `style:` — auto-excluded |
-| `other` | anything else |
+```
+git-cognitive mcp
+```
+
+Start a JSON-RPC MCP server over stdio. Tools:
+
+- **`show`** — full audit for a commit SHA
+- **`blame`** — per-line cognitive data for a file (friction, AI%, zombie flag)
 
 ## Zombie detection
 
-A zombie is an AI-attributed commit that:
-1. Has been unendorsed for >30 days
-2. Has had no human follow-up commit touching the same files
-
-```sh
-git-cognitive index --check-zombies
-```
+A zombie is an AI-attributed commit where none of the changed files have been touched by a human commit in the last 30 days. Flagged automatically during indexing and visible in `blame` as ☠.
 
 ## Agent-Attribution trailer
 
@@ -173,20 +158,6 @@ Add to commit messages for precise attribution without relying on line matching:
 feat: add payment processing flow
 
 Agent-Attribution: 80%
-```
-
-## Team workflow
-
-```sh
-# morning
-git-cognitive pull
-git-cognitive debt
-
-# review queue
-git-cognitive endorse
-
-# weekly
-git-cognitive index --check-zombies
 ```
 
 ## See also
