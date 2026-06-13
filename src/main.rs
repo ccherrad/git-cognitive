@@ -191,10 +191,10 @@ fn sync_pull() -> Result<()> {
     let repo_path = std::path::PathBuf::from(".");
     let db = db::Database::init().context("Failed to initialize database")?;
 
-    let commits = list_branch_commits(&repo_path, "cognitive/v1")?;
+    let shas = list_audited_commits(&repo_path, "cognitive/v1")?;
     let mut synced = 0usize;
 
-    for sha in commits {
+    for sha in shas {
         if let Ok(Some(audit)) = cognitive_debt::read_commit_audit_from_branch(&repo_path, &sha) {
             db.upsert_commit_audit(&audit)
                 .context("Failed to upsert audit")?;
@@ -209,24 +209,35 @@ fn sync_pull() -> Result<()> {
     Ok(())
 }
 
-fn list_branch_commits(repo_path: &std::path::Path, branch: &str) -> Result<Vec<String>> {
+fn list_audited_commits(repo_path: &std::path::Path, branch: &str) -> Result<Vec<String>> {
     let out = std::process::Command::new("git")
         .current_dir(repo_path)
-        .args(["rev-list", branch])
+        .args(["ls-tree", "-r", branch])
         .output()
-        .context("Failed to list branch commits")?;
+        .context("Failed to list branch tree")?;
 
     if !out.status.success() {
         return Ok(vec![]);
     }
 
-    let commits = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut shas = std::collections::HashSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let path = parts[3];
+            if path.ends_with("activity.json") {
+                let shard_parts: Vec<&str> = path.split('/').collect();
+                if shard_parts.len() == 4 {
+                    let shard_prefix = format!("{}{}{}", shard_parts[0], shard_parts[1], shard_parts[2]);
+                    if shard_prefix.len() >= 6 && shard_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                        shas.insert(shard_prefix);
+                    }
+                }
+            }
+        }
+    }
 
-    Ok(commits)
+    Ok(shas.into_iter().collect())
 }
 
 fn mcp_serve() -> Result<()> {
