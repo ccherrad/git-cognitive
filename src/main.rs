@@ -182,14 +182,51 @@ fn sync_pull() -> Result<()> {
         .args(["fetch", "origin", "cognitive/v1:cognitive/v1"])
         .output()
         .context("Failed to run git fetch")?;
-    if out.status.success() {
-        println!("Pulled cognitive/v1 from origin.");
-        println!("Run `git-cognitive blame <file>` to inspect the updated state.");
-    } else {
+    if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("Pull failed: {}", stderr.trim());
     }
+    println!("Pulled cognitive/v1 from origin.");
+
+    let repo_path = std::path::PathBuf::from(".");
+    let db = db::Database::init().context("Failed to initialize database")?;
+
+    let commits = list_branch_commits(&repo_path, "cognitive/v1")?;
+    let mut synced = 0usize;
+
+    for sha in commits {
+        if let Ok(Some(audit)) = cognitive_debt::read_commit_audit_from_branch(&repo_path, &sha) {
+            db.upsert_commit_audit(&audit)
+                .context("Failed to upsert audit")?;
+            synced += 1;
+        }
+    }
+
+    println!("Synced {} audit(s) into database.", synced);
+    if synced > 0 {
+        println!("Run `git-cognitive blame <file>` to inspect the updated state.");
+    }
     Ok(())
+}
+
+fn list_branch_commits(repo_path: &std::path::Path, branch: &str) -> Result<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-list", branch])
+        .output()
+        .context("Failed to list branch commits")?;
+
+    if !out.status.success() {
+        return Ok(vec![]);
+    }
+
+    let commits = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    Ok(commits)
 }
 
 fn mcp_serve() -> Result<()> {
