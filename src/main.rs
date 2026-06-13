@@ -193,11 +193,22 @@ fn sync_pull() -> Result<()> {
 
     let shas = list_audited_commits(&repo_path, "cognitive/v1")?;
     let mut synced = 0usize;
+    let session_cache_dir = repo_path.join(".git").join("cognitive-sessions");
+    std::fs::create_dir_all(&session_cache_dir).ok();
 
     for sha in shas {
         if let Ok(Some(audit)) = cognitive_debt::read_commit_audit_from_branch(&repo_path, &sha) {
             db.upsert_commit_audit(&audit)
                 .context("Failed to upsert audit")?;
+
+            if let Ok(sessions) = cognitive_debt::read_session_slice_from_branch(&repo_path, &sha) {
+                if !sessions.is_empty() {
+                    let shard_dir = session_cache_dir.join(format!("{}{}{}", &sha[..2], &sha[2..4], &sha[4..6]));
+                    std::fs::create_dir_all(&shard_dir).ok();
+                    std::fs::write(shard_dir.join("session.jsonl"), sessions.join("\n") + "\n").ok();
+                }
+            }
+
             synced += 1;
         }
     }

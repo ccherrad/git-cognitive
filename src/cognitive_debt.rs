@@ -67,6 +67,18 @@ pub fn read_commit_audit_from_branch(repo_path: &Path, sha: &str) -> Result<Opti
 
 pub fn read_session_slice_from_branch(repo_path: &Path, sha: &str) -> Result<Vec<String>> {
     let shard = shard_path(sha);
+    let session_cache_path = repo_path.join(".git/cognitive-sessions").join(&shard).join("session.jsonl");
+
+    if session_cache_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&session_cache_path) {
+            return Ok(content
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.is_empty())
+                .collect());
+        }
+    }
+
     let git_path = format!("cognitive/v1:{}/session.jsonl", shard);
 
     let out = Command::new("git")
