@@ -532,26 +532,37 @@ mod tests {
         let temp = setup_test_repo()?;
         let repo_path = temp.path();
 
-        let _initial = make_commit(repo_path, "file.txt", "main", "initial")?;
+        make_commit(repo_path, "file.txt", "initial content", "initial")?;
 
         Command::new("git")
             .current_dir(repo_path)
             .args(["checkout", "-b", "feature"])
             .output()?;
 
-        make_commit(repo_path, "file.txt", "feature work", "feature commit")?;
+        make_commit(repo_path, "feature.txt", "feature content", "feature commit")?;
 
         Command::new("git")
             .current_dir(repo_path)
             .args(["checkout", "main"])
             .output()?;
 
-        make_commit(repo_path, "other.txt", "other", "main work")?;
+        make_commit(repo_path, "main.txt", "main content", "main commit")?;
 
-        Command::new("git")
+        let merge_result = Command::new("git")
             .current_dir(repo_path)
-            .args(["merge", "--no-ff", "feature", "-m", "merge feature"])
+            .args(["merge", "--no-ff", "feature", "-m", "Merge feature"])
             .output()?;
+
+        if !merge_result.status.success() {
+            let err = String::from_utf8_lossy(&merge_result.stderr);
+            panic!("Merge failed: {}", err);
+        }
+
+        let log_result = Command::new("git")
+            .current_dir(repo_path)
+            .args(["log", "--oneline"])
+            .output()?;
+        let log = String::from_utf8_lossy(&log_result.stdout);
 
         let out = Command::new("git")
             .current_dir(repo_path)
@@ -564,7 +575,10 @@ mod tests {
             .filter(|l| !l.is_empty())
             .collect();
 
-        assert!(!merges.is_empty(), "Should detect merge commit");
+        if merges.is_empty() {
+            panic!("No merge commits found. Git log:\n{}", log);
+        }
+
         assert_eq!(merges.len(), 1, "Should have exactly one merge");
 
         Ok(())
