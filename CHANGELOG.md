@@ -2,6 +2,11 @@
 
 All notable changes to git-cognitive are documented here.
 
+## [0.3.7] - 2026-06-21
+
+### Fixed
+- Test suite: use `--no-ff` flag in merge test to ensure merge commit is always created
+
 ## [0.3.6] - 2026-06-21
 
 ### Fixed
