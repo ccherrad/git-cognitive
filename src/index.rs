@@ -550,7 +550,7 @@ mod tests {
 
         Command::new("git")
             .current_dir(repo_path)
-            .args(["merge", "feature", "-m", "merge feature"])
+            .args(["merge", "--no-ff", "feature", "-m", "merge feature"])
             .output()?;
 
         let out = Command::new("git")
