@@ -29,6 +29,7 @@ pub struct CommitAudit {
     pub session_duration_secs: Option<u64>,
     pub fatigue: bool,
     pub zombie: bool,
+    pub committed_at: String,
     pub audited_at: String,
     pub hotspots: Vec<FileHotspot>,
 }
@@ -418,6 +419,10 @@ pub fn now_rfc3339() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    timestamp_to_rfc3339(secs)
+}
+
+pub fn timestamp_to_rfc3339(secs: u64) -> String {
     let (y, mo, d, h, mi, s) = epoch_to_parts(secs);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }

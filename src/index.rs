@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::cognitive_debt::{
-    detect_ai_attribution, now_rfc3339, CommitAudit, DebtStore, FileHotspot,
+    detect_ai_attribution, now_rfc3339, timestamp_to_rfc3339, CommitAudit, DebtStore, FileHotspot,
 };
 use crate::db::Database;
 use crate::session::{attribute_commit, Attribution};
@@ -266,6 +266,7 @@ fn build_commit_audit(repo_path: &Path, commit: &CommitInfo) -> Result<(CommitAu
             session_duration_secs,
             fatigue,
             zombie: false,
+            committed_at: timestamp_to_rfc3339(commit.timestamp),
             audited_at: now_rfc3339(),
             hotspots,
         },

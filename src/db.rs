@@ -28,6 +28,7 @@ impl Database {
                 session_duration_secs INTEGER,
                 fatigue INTEGER NOT NULL DEFAULT 0,
                 zombie INTEGER NOT NULL DEFAULT 0,
+                committed_at TEXT NOT NULL,
                 audited_at TEXT NOT NULL,
                 hotspots_json TEXT NOT NULL DEFAULT '[]'
             );
@@ -50,8 +51,8 @@ impl Database {
                 (id, branch, title, summary, commits_json,
                  since_sha, until_sha, cognitive_friction_score, ai_attributed,
                  attribution_pct, lines_changed, large_diff, session_duration_secs,
-                 fatigue, zombie, audited_at, hotspots_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                 fatigue, zombie, committed_at, audited_at, hotspots_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title,
                 summary=excluded.summary,
@@ -66,6 +67,7 @@ impl Database {
                 session_duration_secs=excluded.session_duration_secs,
                 fatigue=excluded.fatigue,
                 zombie=excluded.zombie,
+                committed_at=excluded.committed_at,
                 audited_at=excluded.audited_at,
                 hotspots_json=excluded.hotspots_json",
                 params![
@@ -84,6 +86,7 @@ impl Database {
                     item.session_duration_secs.map(|v| v as i64),
                     item.fatigue as i64,
                     item.zombie as i64,
+                    &item.committed_at,
                     &item.audited_at,
                     &hotspots_json,
                 ],
@@ -100,7 +103,7 @@ impl Database {
             "SELECT id, branch, title, summary, commits_json,
                     since_sha, until_sha, cognitive_friction_score, ai_attributed,
                     attribution_pct, lines_changed, large_diff, session_duration_secs,
-                    fatigue, zombie, audited_at, hotspots_json
+                    fatigue, zombie, committed_at, audited_at, hotspots_json
              FROM commit_audits ORDER BY audited_at DESC",
         )?;
 
@@ -124,6 +127,7 @@ impl Database {
                     row.get::<_, i64>(14)?,
                     row.get::<_, String>(15)?,
                     row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
                 ))
             })?
             .map(|row| {
@@ -143,6 +147,7 @@ impl Database {
                     session_duration_secs,
                     fatigue,
                     zombie,
+                    committed_at,
                     audited_at,
                     hotspots_json,
                 ) = row?;
@@ -169,6 +174,7 @@ impl Database {
                     session_duration_secs: session_duration_secs.map(|v| v as u64),
                     fatigue: fatigue != 0,
                     zombie: zombie != 0,
+                    committed_at,
                     audited_at,
                     hotspots,
                 })
