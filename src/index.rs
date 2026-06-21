@@ -459,3 +459,103 @@ fn current_branch(repo_path: &Path) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_test_repo() -> Result<TempDir> {
+        let temp = TempDir::new()?;
+        let repo_path = temp.path();
+
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["init"])
+            .output()?;
+
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()?;
+
+        Ok(temp)
+    }
+
+    fn make_commit(repo_path: &Path, file: &str, content: &str, msg: &str) -> Result<String> {
+        fs::write(repo_path.join(file), content)?;
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["add", file])
+            .output()?;
+
+        let out = Command::new("git")
+            .current_dir(repo_path)
+            .args(["commit", "-m", msg])
+            .output()?;
+
+        if !out.status.success() {
+            anyhow::bail!("Failed to commit");
+        }
+
+        let sha_out = Command::new("git")
+            .current_dir(repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+
+        Ok(String::from_utf8_lossy(&sha_out.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn test_detect_unsynced_merges_no_merges() -> Result<()> {
+        let temp = setup_test_repo()?;
+        let repo_path = temp.path();
+
+        make_commit(repo_path, "file.txt", "content", "initial")?;
+        make_commit(repo_path, "file.txt", "updated", "second")?;
+
+        let merges = detect_unsynced_merges(repo_path)?;
+        assert!(merges.is_empty(), "Should have no merge commits");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_detect_unsynced_merges_with_merge() -> Result<()> {
+        let temp = setup_test_repo()?;
+        let repo_path = temp.path();
+
+        make_commit(repo_path, "file.txt", "main", "initial")?;
+
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["checkout", "-b", "feature"])
+            .output()?;
+
+        make_commit(repo_path, "file.txt", "feature work", "feature commit")?;
+
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["checkout", "main"])
+            .output()?;
+
+        make_commit(repo_path, "other.txt", "other", "main work")?;
+
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["merge", "feature", "-m", "merge feature"])
+            .output()?;
+
+        let merges = detect_unsynced_merges(repo_path)?;
+        assert!(!merges.is_empty(), "Should detect merge commit");
+        assert_eq!(merges.len(), 1, "Should have exactly one merge");
+
+        Ok(())
+    }
+}
