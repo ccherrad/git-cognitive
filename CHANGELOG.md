@@ -2,6 +2,11 @@
 
 All notable changes to git-cognitive are documented here.
 
+## [0.3.6] - 2026-06-21
+
+### Fixed
+- Test suite: ensure all tests pass independently without flaky behavior
+
 ## [0.3.5] - 2026-06-21
 
 ### Fixed
