@@ -1,5 +1,18 @@
 # Testing Guide for Merge Sync Features
 
+## Session Preservation
+
+Sessions are **always preserved** for every commit (merge or normal):
+
+1. `build_commit_audit()` calls `attribute_commit()` which extracts `session_slice`
+2. `store.write_session()` writes it to `.git/cognitive-sessions/{shard}/session.jsonl`
+3. Sessions survive:
+   - Merges (three-way, rebase, squash)
+   - JSON export (embedded in audits)
+   - Cloud DB sync (part of audit data)
+
+No sessions are lost regardless of merge strategy or export method.
+
 ## Automated Tests
 
 Run the test suite:
