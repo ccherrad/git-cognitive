@@ -23,7 +23,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Index the minimal set of commits covering the current repo state")]
-    Index,
+    Index {
+        #[arg(long, help = "Write audit data as JSON to file instead of SQLite database")]
+        output_json: Option<PathBuf>,
+        #[arg(long, help = "Auto-sync merge commits in cognitive debt branch before indexing")]
+        auto_sync: bool,
+    },
+
+    #[command(about = "Sync merge commits to cognitive debt branch")]
+    Sync,
 
     #[command(about = "Interactive blame view with cognitive audit overlay")]
     Blame {
@@ -63,9 +71,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index => {
+        Commands::Index { output_json, auto_sync } => {
             let repo_path = PathBuf::from(".");
-            index::run_index(&repo_path)?;
+            if auto_sync {
+                index::run_sync(&repo_path)?;
+            }
+            index::run_index(&repo_path, output_json)?;
+        }
+        Commands::Sync => {
+            let repo_path = PathBuf::from(".");
+            index::run_sync(&repo_path)?;
         }
         Commands::Blame { file } => {
             blame_command(&file)?;

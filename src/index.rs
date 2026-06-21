@@ -20,9 +20,51 @@ pub struct CommitInfo {
     pub files_changed: Vec<String>,
 }
 
-pub fn run_index(repo_path: &Path) -> Result<()> {
-    let db = Database::init().context("Failed to initialize database")?;
-    let commits = fetch_covering_commits(repo_path, &db)?;
+pub fn run_sync(repo_path: &Path) -> Result<()> {
+    let merge_commits = detect_unsynced_merges(repo_path)?;
+
+    if merge_commits.is_empty() {
+        println!("No new merge commits to sync.");
+        return Ok(());
+    }
+
+    println!("Found {} merge commit(s) to sync.", merge_commits.len());
+
+    let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
+    let mut synced = 0usize;
+
+    for sha in &merge_commits {
+        match fetch_commit(repo_path, sha) {
+            Ok(commit) => {
+                match build_commit_audit(repo_path, &commit) {
+                    Ok((audit, session_slice)) => {
+                        store.write_audit(&audit)?;
+                        store.write_session(&commit.sha, &session_slice)?;
+                        synced += 1;
+                        println!(
+                            "  {} {} (merge)",
+                            &commit.short_sha, audit.title
+                        );
+                    }
+                    Err(e) => eprintln!("Failed to audit {}: {}", sha, e),
+                }
+            }
+            Err(e) => eprintln!("Failed to fetch {}: {}", sha, e),
+        }
+    }
+
+    store.commit()?;
+    println!("Sync complete — {} merge(s) synced.", synced);
+    Ok(())
+}
+
+pub fn run_index(repo_path: &Path, output_json: Option<std::path::PathBuf>) -> Result<()> {
+    let commits = if output_json.is_some() {
+        fetch_all_commits(repo_path)?
+    } else {
+        let db = Database::init().context("Failed to initialize database")?;
+        fetch_covering_commits(repo_path, &db)?
+    };
 
     if commits.is_empty() {
         println!("Nothing to index — already up to date.");
@@ -31,32 +73,75 @@ pub fn run_index(repo_path: &Path) -> Result<()> {
 
     let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
     let mut audited = 0usize;
+    let mut audits = Vec::new();
 
     for commit in &commits {
         let (item, session_slice) = build_commit_audit(repo_path, commit)?;
         store.write_audit(&item)?;
         store.write_session(&commit.sha, &session_slice)?;
-        db.upsert_commit_audit(&item)?;
+
+        if output_json.is_none() {
+            let db = Database::init().context("Failed to initialize database")?;
+            db.upsert_commit_audit(&item)?;
+        }
+
+        audits.push(item);
         audited += 1;
-        println!(
-            "  {} {} (friction: {:.2})",
-            &commit.short_sha, item.title, item.cognitive_friction_score
-        );
     }
 
     store.commit()?;
-    println!("Index complete — {} commit(s) processed.", audited);
+
+    if let Some(json_path) = output_json {
+        let json_data = serde_json::to_string_pretty(&audits)
+            .context("Failed to serialize audits to JSON")?;
+        std::fs::write(&json_path, json_data)
+            .context("Failed to write JSON file")?;
+        println!("Index complete — {} commit(s) written to {}.", audited, json_path.display());
+    } else {
+        for audit in &audits {
+            println!(
+                "  {} {} (friction: {:.2})",
+                &audit.id[..8.min(audit.id.len())], audit.title, audit.cognitive_friction_score
+            );
+        }
+        println!("Index complete — {} commit(s) processed.", audited);
+    }
+
     Ok(())
 }
 
-fn fetch_covering_commits(repo_path: &Path, db: &Database) -> Result<Vec<CommitInfo>> {
-    let already_indexed: HashSet<String> = db
-        .all_commit_audits()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.id)
+fn detect_unsynced_merges(repo_path: &Path) -> Result<Vec<String>> {
+    let db = Database::init().context("Failed to initialize database")?;
+    let audits = db.all_commit_audits().unwrap_or_default();
+
+    let last_audited = audits.first().map(|a| a.id.clone());
+
+    let merge_range = if let Some(last) = last_audited {
+        format!("{}..HEAD", last)
+    } else {
+        "HEAD".to_string()
+    };
+
+    let out = Command::new("git")
+        .current_dir(repo_path)
+        .args(["log", "--merges", "--format=%H", &merge_range])
+        .output()
+        .context("Failed to detect merge commits")?;
+
+    if !out.status.success() {
+        return Ok(vec![]);
+    }
+
+    let shas: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
         .collect();
 
+    Ok(shas)
+}
+
+fn fetch_all_commits(repo_path: &Path) -> Result<Vec<CommitInfo>> {
     let ls = Command::new("git")
         .current_dir(repo_path)
         .args(["ls-files"])
@@ -83,7 +168,7 @@ fn fetch_covering_commits(repo_path: &Path, db: &Database) -> Result<Vec<CommitI
             _ => continue,
         };
 
-        if sha.is_empty() || seen.contains(&sha) || already_indexed.contains(&sha) {
+        if sha.is_empty() || seen.contains(&sha) {
             continue;
         }
 
@@ -99,6 +184,20 @@ fn fetch_covering_commits(repo_path: &Path, db: &Database) -> Result<Vec<CommitI
         files.len(),
         commits.len()
     );
+
+    Ok(commits)
+}
+
+fn fetch_covering_commits(repo_path: &Path, db: &Database) -> Result<Vec<CommitInfo>> {
+    let already_indexed: HashSet<String> = db
+        .all_commit_audits()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+
+    let mut commits = fetch_all_commits(repo_path)?;
+    commits.retain(|c| !already_indexed.contains(&c.sha));
 
     Ok(commits)
 }

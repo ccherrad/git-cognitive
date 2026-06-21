@@ -12,7 +12,7 @@ impl Database {
         let conn = Connection::open(&db_path).context("Failed to open database connection")?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS activity_items (
+            "CREATE TABLE IF NOT EXISTS commit_audits (
                 id TEXT PRIMARY KEY,
                 branch TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -46,7 +46,7 @@ impl Database {
 
         self.conn
             .execute(
-                "INSERT INTO activity_items
+                "INSERT INTO commit_audits
                 (id, branch, title, summary, commits_json,
                  since_sha, until_sha, cognitive_friction_score, ai_attributed,
                  attribution_pct, lines_changed, large_diff, session_duration_secs,
@@ -88,7 +88,7 @@ impl Database {
                     &hotspots_json,
                 ],
             )
-            .context("Failed to upsert activity item")?;
+            .context("Failed to upsert commit audit")?;
 
         Ok(())
     }
@@ -101,7 +101,7 @@ impl Database {
                     since_sha, until_sha, cognitive_friction_score, ai_attributed,
                     attribution_pct, lines_changed, large_diff, session_duration_secs,
                     fatigue, zombie, audited_at, hotspots_json
-             FROM activity_items ORDER BY audited_at DESC",
+             FROM commit_audits ORDER BY audited_at DESC",
         )?;
 
         let items = stmt
