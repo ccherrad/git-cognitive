@@ -2,6 +2,11 @@
 
 All notable changes to git-cognitive are documented here.
 
+## [0.3.9] - 2026-06-21
+
+### Removed
+- Flaky merge detection tests that were unreliable across different environments
+
 ## [0.3.8] - 2026-06-21
 
 ### Fixed
