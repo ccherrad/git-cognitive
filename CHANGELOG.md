@@ -2,6 +2,11 @@
 
 All notable changes to git-cognitive are documented here.
 
+## [0.3.8] - 2026-06-21
+
+### Fixed
+- Test suite: ensure merge test creates proper divergent history so merge commit is detected
+
 ## [0.3.7] - 2026-06-21
 
 ### Fixed
