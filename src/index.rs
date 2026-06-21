@@ -553,7 +553,6 @@ mod tests {
             .args(["merge", "feature", "-m", "merge feature"])
             .output()?;
 
-        // Just check that git log --merges detects the merge (simpler, no DB needed)
         let out = Command::new("git")
             .current_dir(repo_path)
             .args(["log", "--merges", "--format=%H"])
