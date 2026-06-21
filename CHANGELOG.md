@@ -2,6 +2,12 @@
 
 All notable changes to git-cognitive are documented here.
 
+## [0.3.5] - 2026-06-21
+
+### Fixed
+- Test suite: correct merge detection test to not depend on database state
+- Ensure tests pass independently without external state
+
 ## [0.3.4] - 2026-06-21
 
 ### Added
