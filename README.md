@@ -17,18 +17,19 @@ AI coding agents ship code fast. Humans lose track of what was AI-generated and 
 
 1. Attributes AI lines by matching Claude session tool calls against the commit diff
 2. Scores friction via tree-sitter AST analysis (complexity, doc gap, author churn)
-3. Stores results in SQLite (`.git/cognitive.db`) and the `cognitive/v1` orphan branch
+3. Detects merge commits (via `--auto-sync` or `sync` command)
+4. Stores results in SQLite (`.git/cognitive.db`) and the `cognitive/v1` orphan branch
 
 Each commit gets two files in a sharded orphan branch:
 
 ```
 cognitive/v1
 └── ab/cd/ef/
-    ├── activity.json   — friction score, AI attribution, hotspots, zombie flag
+    ├── activity.json   — friction score, AI attribution, hotspots, zombie flag, committed_at timestamp
     └── session.jsonl   — the Claude conversation that produced this commit
 ```
 
-No external service. No daemon. Everything in git.
+No external service. No daemon. Everything in git. Sessions are preserved across all merge strategies (three-way, squash, rebase).
 
 ## Friction score
 
@@ -91,10 +92,14 @@ Writes `.git/hooks/post-commit` to auto-index and push on every commit.
 ### `index`
 
 ```
-git-cognitive index
+git-cognitive index [--auto-sync] [--output-json <path>]
 ```
 
 Finds the minimal covering set of commits for the current repo state: `git ls-files` → last-touching SHA per file → dedup → skip already-indexed. Idempotent — safe to run repeatedly.
+
+Flags:
+- `--auto-sync` — automatically detect and sync merge commits before indexing
+- `--output-json <path>` — export audits as JSON (useful for cloud DB integration)
 
 ### `blame`
 
@@ -126,6 +131,14 @@ git-cognitive session <SHA>|HEAD
 
 Shows the Claude conversation (prompts, responses, tool calls) captured for this commit's window.
 
+### `sync`
+
+```
+git-cognitive sync
+```
+
+Detect and sync merge commits (including three-way, squash, and rebase merges) from the working tree to the cognitive debt branch. Useful for tracking merge commits created via GitHub/Bitbucket UI.
+
 ### `push` / `pull`
 
 ```
@@ -133,7 +146,7 @@ git-cognitive push
 git-cognitive pull
 ```
 
-Share cognitive debt data with your team via the `cognitive/v1` branch.
+Share cognitive debt data with your team via the `cognitive/v1` branch. Preserves session data across all merge strategies and export methods.
 
 ### `mcp`
 
