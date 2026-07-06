@@ -2,6 +2,12 @@
 
 All notable changes to git-cognitive are documented here.
 
+## [0.3.10] - 2026-07-06
+
+### Added
+- Prebuilt `x86_64-apple-darwin` (Intel macOS) binary in release builds
+- `install.sh` one-line installer that detects platform and installs the latest release binary
+
 ## [0.3.9] - 2026-06-21
 
 ### Removed
