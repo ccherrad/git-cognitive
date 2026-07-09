@@ -15,7 +15,7 @@ AI coding agents ship code fast. Humans lose track of what was AI-generated and 
 
 `git-cognitive index` finds the minimal set of commits that covers the current state of your repo — the last commit that touched each tracked file — and builds a `CommitAudit` for each one:
 
-1. Attributes AI lines by matching Claude session tool calls against the commit diff
+1. Attributes AI lines by matching agent session tool calls against the commit diff
 2. Scores friction via tree-sitter AST analysis (complexity, doc gap, author churn)
 3. Detects merge commits (via `--auto-sync` or `sync` command)
 4. Stores results in SQLite (`.git/cognitive.db`) and the `cognitive/v1` orphan branch
@@ -26,10 +26,21 @@ Each commit gets two files in a sharded orphan branch:
 cognitive/v1
 └── ab/cd/ef/
     ├── activity.json   — friction score, AI attribution, hotspots, zombie flag, committed_at timestamp
-    └── session.jsonl   — the Claude conversation that produced this commit
+    └── session.jsonl   — the agent conversation that produced this commit
 ```
 
-No external service. No daemon. Everything in git. Sessions are preserved across all merge strategies (three-way, squash, rebase).
+No external service. No daemon. Everything in git. Sessions are preserved across all merge strategies (three-way, squash, rebase), and audits are re-keyed automatically when commits are rewritten by rebase or amend.
+
+## Supported agents
+
+Sessions are discovered on disk by encoding the repo path into each agent's per-project store — no agent hooks required. Supported agents:
+
+- **claude** — Claude Code
+- **cursor** — Cursor
+- **factory** — Factory Droid (aliases: `droid`, `factory-droid`)
+- **pi** — Pi
+
+Enable one or more with `git-cognitive enable <agent>`. Enabled agents are recorded in `.git/cognitive-agents` (defaults to `claude` when unset).
 
 ## Friction score
 
@@ -66,7 +77,7 @@ cargo install --path .
 ## Quickstart
 
 ```sh
-# 1. Enable automatic indexing on every commit
+# 1. Enable automatic indexing on every commit (claude, cursor, factory, pi)
 git-cognitive enable claude
 
 # 2. Index the current repo state
@@ -84,10 +95,16 @@ git-cognitive push
 ### `enable`
 
 ```
-git-cognitive enable claude
+git-cognitive enable <agent>   # claude, cursor, factory, pi
 ```
 
-Writes `.git/hooks/post-commit` to auto-index and push on every commit.
+Records the agent in `.git/cognitive-agents` and installs three git hooks:
+
+- **post-commit** — index the new commit in the background (`git commit` returns immediately)
+- **post-rewrite** — after a rebase/amend, migrate audits to the rewritten SHAs
+- **pre-push** — prune orphaned audits (`gc`), then push `cognitive/v1` to origin
+
+Run `enable` again with a different agent to track several at once.
 
 ### `index`
 
@@ -129,7 +146,15 @@ Full audit detail for a commit: friction score, AI attribution, lines changed, s
 git-cognitive session <SHA>|HEAD
 ```
 
-Shows the Claude conversation (prompts, responses, tool calls) captured for this commit's window.
+Shows the full agent conversation (prompts, responses, tool calls) captured for this commit's window, plus the list of files it modified.
+
+### `gc`
+
+```
+git-cognitive gc
+```
+
+Prune audits for commits no longer reachable from any local branch — cleans up entries orphaned when a rebase or squash-merge drops their original SHAs. Runs automatically on `pre-push`.
 
 ### `sync`
 
