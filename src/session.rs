@@ -1,39 +1,77 @@
+use crate::agent::Agent;
+use crate::parse;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Find the active Claude Code JSONL for this project.
-/// Returns the path to the most recently modified JSONL.
-fn find_active_session(repo_path: &Path) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+/// Min and max message timestamp inside a session JSONL.
+/// Returns None if the file has no parseable record timestamps.
+fn session_ts_range(path: &Path) -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut min: Option<u64> = None;
+    let mut max: Option<u64> = None;
 
-    let cwd = repo_path.canonicalize().ok()?;
-    let cwd_key = cwd.to_string_lossy().replace('/', "-");
+    for line in parse::parse_lines(content.lines()) {
+        let ts = parse_iso_ts(&line.timestamp);
+        if ts == 0 {
+            continue;
+        }
+        min = Some(min.map_or(ts, |m| m.min(ts)));
+        max = Some(max.map_or(ts, |m| m.max(ts)));
+    }
 
-    let project_dir = std::fs::read_dir(&projects_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .find(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name == cwd_key || name.trim_start_matches('-') == cwd_key.trim_start_matches('-')
-        })?
-        .path();
+    Some((min?, max?))
+}
 
-    let mut sessions: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&project_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .filter_map(|e| {
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            Some((mtime, e.path()))
-        })
-        .collect();
+/// Find the Claude Code JSONL whose message window overlaps this commit.
+///
+/// Sessions are selected by their internal message timestamps, not file
+/// mtime — an mtime can be bumped by a sync or checkout long after the
+/// conversation ended. A session overlaps the commit window when it has any
+/// message in `(prev_commit_ts, commit_ts + 60]`. If several overlap, the one
+/// whose last message is closest to (but not past) the commit wins. If none
+/// overlap, fall back to the session with the newest last message.
+fn find_active_session(
+    repo_path: &Path,
+    commit_ts: u64,
+    prev_commit_ts: u64,
+    agents: &[Box<dyn Agent>],
+) -> Option<PathBuf> {
+    // Gather transcript candidates across every enabled agent's project store.
+    let mut candidates: Vec<(u64, u64, PathBuf)> = Vec::new();
+    for agent in agents {
+        let Some(project_dir) = agent.project_dir(repo_path) else {
+            continue;
+        };
+        let ext = agent.transcript_ext();
+        let files = std::fs::read_dir(&project_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some(ext))
+            .filter_map(|p| session_ts_range(&p).map(|(min, max)| (min, max, p)));
+        candidates.extend(files);
+    }
 
-    sessions.sort_by(|a, b| b.0.cmp(&a.0));
-    sessions.into_iter().next().map(|(_, p)| p)
+    let window_hi = commit_ts + 60;
+
+    // Prefer a session that actually overlaps (prev_commit_ts, commit_ts + 60].
+    let overlapping = candidates
+        .iter()
+        .filter(|(min, max, _)| *max > prev_commit_ts && *min <= window_hi)
+        .max_by_key(|(_, max, _)| *max);
+
+    if let Some((_, _, path)) = overlapping {
+        return Some(path.clone());
+    }
+
+    // No overlap — fall back to the session with the newest last message.
+    candidates
+        .into_iter()
+        .max_by_key(|(_, max, _)| *max)
+        .map(|(_, _, p)| p)
 }
 
 /// Parse ISO 8601 timestamp to unix seconds.
@@ -146,7 +184,7 @@ pub struct Attribution {
 
 /// Attribute a commit to a Claude session.
 ///
-/// 1. Find the active session JSONL in ~/.claude/projects/<project>/
+/// 1. Find the active session transcript in an enabled agent's project store
 /// 2. Slice it to the window (prev_commit_ts, commit_ts]
 /// 3. Match agent Write/Edit lines against git diff lines by file+content
 /// 4. Return attribution + the raw JSONL slice for storage
@@ -155,8 +193,10 @@ pub fn attribute_commit(
     sha: &str,
     commit_ts: u64,
     prev_commit_ts: u64,
+    agents: &[Box<dyn Agent>],
 ) -> Attribution {
-    let Some(session_path) = find_active_session(repo_path) else {
+    let Some(session_path) = find_active_session(repo_path, commit_ts, prev_commit_ts, agents)
+    else {
         return Attribution {
             ai_attributed: false,
             attribution_pct: None,
@@ -189,17 +229,12 @@ pub fn attribute_commit(
             continue;
         }
 
-        let record: serde_json::Value = match serde_json::from_str(raw_line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let record = match parse::parse_line(raw_line) {
+            Some(r) => r,
+            None => continue,
         };
 
-        let ts = parse_iso_ts(
-            record
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        );
+        let ts = parse_iso_ts(&record.timestamp);
 
         if ts == 0 || ts <= prev_commit_ts || ts > commit_ts + 60 {
             continue;
@@ -212,38 +247,23 @@ pub fn attribute_commit(
 
         session_slice.push(raw_line.to_string());
 
-        if record.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        if record.type_ != parse::TYPE_ASSISTANT {
             continue;
         }
 
-        let blocks = match record.pointer("/message/content") {
-            Some(serde_json::Value::Array(b)) => b,
-            _ => continue,
-        };
-
-        for block in blocks {
-            if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+        for block in record.content_blocks() {
+            if !block.is_tool_use() {
                 continue;
             }
 
-            let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let input = match block.get("input") {
-                Some(v) => v,
-                None => continue,
-            };
-
-            let file = match input.get("file_path").and_then(|v| v.as_str()) {
+            let file = match block.tool_file() {
                 Some(f) => normalize_path(f),
                 None => continue,
             };
 
-            let written = match tool {
-                "Write" => input.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "Edit" => input
-                    .get("new_string")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
-                _ => continue,
+            let written = match block.written_content() {
+                Some(w) => w,
+                None => continue,
             };
 
             let lines: Vec<String> = written
@@ -328,75 +348,39 @@ pub fn run_show_session(repo_path: &Path, sha: &str) -> Result<()> {
         return Ok(());
     }
 
+    let records = parse::parse_lines(lines.iter());
+    let modified = parse::extract_modified_files(&records);
+
     println!("\n--- session slice for {} ---\n", &sha[..8.min(sha.len())]);
-    for line in &lines {
-        let record: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => {
-                println!("{}", line);
-                continue;
-            }
-        };
+    if !modified.is_empty() {
+        println!("modified files ({}):", modified.len());
+        for file in &modified {
+            println!("  {}", file);
+        }
+        println!();
+    }
 
-        let role = record.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-        let ts = record
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .get(..19)
-            .unwrap_or("");
+    for record in &records {
+        let ts = record.short_ts();
 
-        match role {
-            "user" => {
-                let text = record
-                    .pointer("/message/content")
-                    .and_then(|v| match v {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        serde_json::Value::Array(arr) => {
-                            let parts: Vec<&str> = arr
-                                .iter()
-                                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                                .collect();
-                            if parts.is_empty() {
-                                None
-                            } else {
-                                Some(parts.join(" "))
-                            }
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_default();
+        match record.type_.as_str() {
+            parse::TYPE_USER => {
+                let text = record.user_text();
                 if !text.is_empty() {
-                    println!("[{}] human: {}", ts, &text[..120.min(text.len())]);
+                    println!("[{}] human: {}", ts, text);
                 }
             }
-            "assistant" => {
-                let blocks = match record.pointer("/message/content") {
-                    Some(serde_json::Value::Array(b)) => b,
-                    _ => continue,
-                };
-                for block in blocks {
-                    match block.get("type").and_then(|v| v.as_str()) {
-                        Some("text") => {
-                            let text = block
-                                .get("text")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim();
-                            if !text.is_empty() {
-                                println!("[{}] agent: {}", ts, &text[..120.min(text.len())]);
-                            }
+            parse::TYPE_ASSISTANT => {
+                for block in record.content_blocks() {
+                    if block.is_text() {
+                        let text = block.text.trim();
+                        if !text.is_empty() {
+                            println!("[{}] agent: {}", ts, text);
                         }
-                        Some("tool_use") => {
-                            let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                            let file = block
-                                .pointer("/input/file_path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            println!("[{}] tool:  {} {}", ts, tool, file);
-                        }
-                        _ => {}
+                    } else if block.is_tool_use() {
+                        let tool = if block.name.is_empty() { "?" } else { &block.name };
+                        let file = block.tool_file().unwrap_or("");
+                        println!("[{}] tool:  {} {}", ts, tool, file);
                     }
                 }
             }

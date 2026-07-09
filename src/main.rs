@@ -1,13 +1,15 @@
+mod agent;
 mod blame;
 mod cognitive_debt;
 mod db;
 mod index;
+mod parse;
 mod session;
 mod treesitter;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "git-cognitive")]
@@ -54,12 +56,21 @@ enum Commands {
     #[command(about = "Push cognitive debt data to origin")]
     Push,
 
+    #[command(
+        hide = true,
+        about = "Migrate audits for rewritten commits (reads 'old new' pairs from stdin; git post-rewrite hook)"
+    )]
+    PostRewrite,
+
+    #[command(about = "Prune audits for commits no longer reachable from any local branch")]
+    Gc,
+
     #[command(about = "Pull cognitive debt data from origin")]
     Pull,
 
     #[command(about = "Enable a coding agent for this project (e.g. claude)")]
     Enable {
-        #[arg(help = "Agent to enable: claude")]
+        #[arg(help = "Agent to enable: claude, cursor, factory, pi")]
         agent: String,
     },
 
@@ -96,10 +107,9 @@ fn main() -> Result<()> {
         }
         Commands::Push => sync_push()?,
         Commands::Pull => sync_pull()?,
-        Commands::Enable { agent } => match agent.as_str() {
-            "claude" => enable_claude()?,
-            other => anyhow::bail!("Unknown agent '{}'. Supported: claude", other),
-        },
+        Commands::PostRewrite => index::run_post_rewrite(&PathBuf::from("."))?,
+        Commands::Gc => index::run_gc(&PathBuf::from("."))?,
+        Commands::Enable { agent: name } => enable_agent(&name)?,
         Commands::Mcp => mcp_serve()?,
     }
 
@@ -179,8 +189,10 @@ fn blame_command(file: &str) -> Result<()> {
 }
 
 fn sync_push() -> Result<()> {
+    // --no-verify skips the pre-push hook: without it, this push would re-trigger
+    // the very pre-push hook that invoked `git-cognitive push`, recursing forever.
     let out = std::process::Command::new("git")
-        .args(["push", "origin", "cognitive/v1"])
+        .args(["push", "--no-verify", "origin", "cognitive/v1"])
         .output()
         .context("Failed to run git push")?;
     if out.status.success() {
@@ -481,48 +493,96 @@ fn mcp_show(sha: &str) -> Result<serde_json::Value> {
     }
 }
 
-fn enable_claude() -> Result<()> {
+fn enable_agent(name: &str) -> Result<()> {
+    if agent::by_name(name).is_none() {
+        anyhow::bail!(
+            "Unknown agent '{}'. Supported: {}",
+            name,
+            agent::SUPPORTED.join(", ")
+        );
+    }
+
+    let repo_path = PathBuf::from(".");
+    let canonical = agent::by_name(name).unwrap().name();
+    agent::enable(&repo_path, canonical).context("Failed to record enabled agent")?;
+    println!("Enabled agent: {canonical}");
+
     let git_hooks_dir = PathBuf::from(".git/hooks");
     if !git_hooks_dir.exists() {
         anyhow::bail!("No .git/hooks directory found — are you in a git repository?");
     }
 
-    // --- post-commit hook ---
-    let post_commit = git_hooks_dir.join("post-commit");
-    let post_commit_script = "#!/bin/sh\nsleep 2\ngit-cognitive index 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n";
+    // post-commit: index in the background so `git commit` returns immediately.
+    // Indexing runs per-commit, but must never push (that happens on pre-push).
+    install_hook(
+        &git_hooks_dir.join("post-commit"),
+        "post-commit",
+        "git-cognitive index",
+        "git-cognitive index >/dev/null 2>&1 &",
+    )?;
 
-    let should_write = if post_commit.exists() {
-        let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
-        !existing.contains("git-cognitive index")
-    } else {
-        true
-    };
+    // post-rewrite: after a rebase/amend rewrites commits, migrate their audits
+    // to the new SHAs. Git feeds 'old new' pairs on stdin, which we forward.
+    install_hook(
+        &git_hooks_dir.join("post-rewrite"),
+        "post-rewrite",
+        "git-cognitive post-rewrite",
+        "git-cognitive post-rewrite >/dev/null 2>&1 || true",
+    )?;
 
-    if should_write {
-        if post_commit.exists() {
-            let existing = std::fs::read_to_string(&post_commit).unwrap_or_default();
-            let appended = format!(
-                "{}\n# git-cognitive\nsleep 2\ngit-cognitive index 2>/dev/null || true\ngit-cognitive push 2>/dev/null || true\n",
-                existing.trim()
-            );
-            std::fs::write(&post_commit, appended)?;
-        } else {
-            std::fs::write(&post_commit, post_commit_script)?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&post_commit, std::fs::Permissions::from_mode(0o755))
-                .context("Failed to set post-commit hook permissions")?;
-        }
-        println!("  wrote .git/hooks/post-commit");
-    } else {
-        println!("  .git/hooks/post-commit already configured — nothing to do.");
-    }
+    // pre-push: prune audits orphaned by rebase/squash, then push. Runs
+    // synchronously so cognitive/v1 is reconciled and up on origin before the
+    // push completes.
+    install_hook(
+        &git_hooks_dir.join("pre-push"),
+        "pre-push",
+        "git-cognitive push",
+        "git-cognitive gc >/dev/null 2>&1 || true\ngit-cognitive push 2>/dev/null || true",
+    )?;
 
-    println!("\nDone. Every commit will now:");
-    println!("  • snapshot the active Claude session");
+    let enabled = agent::enabled_names(&repo_path).join(", ");
+    println!("\nDone. Enabled agents: {enabled}");
+    println!("On every commit (in the background):");
+    println!("  • snapshot the active agent session");
     println!("  • attribute AI lines to that commit");
     println!("  • score friction and classify");
+    println!("On rebase/amend:");
+    println!("  • migrate audits to rewritten commits");
+    println!("On push:");
+    println!("  • prune orphaned audits, then push to origin");
+    Ok(())
+}
+
+/// Install (or append) a git hook that runs `command_line`.
+///
+/// `marker` is a substring that, if already present in an existing hook,
+/// means git-cognitive is configured and nothing is written.
+fn install_hook(path: &Path, name: &str, marker: &str, command_line: &str) -> Result<()> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if existing.contains(marker) {
+        println!("  .git/hooks/{name} already configured — nothing to do.");
+        return Ok(());
+    }
+
+    let contents = if existing.trim().is_empty() {
+        format!("#!/bin/sh\n{command_line}\n")
+    } else {
+        format!("{}\n# git-cognitive\n{command_line}\n", existing.trim())
+    };
+    std::fs::write(path, contents)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to set {name} hook permissions"))?;
+    }
+
+    println!("  wrote .git/hooks/{name}");
     Ok(())
 }

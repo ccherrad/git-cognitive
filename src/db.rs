@@ -39,6 +39,31 @@ impl Database {
         Ok(Database { conn })
     }
 
+    /// Delete an audit by commit SHA. Returns true if a row was removed.
+    pub fn delete_commit_audit(&self, sha: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM commit_audits WHERE id = ?1", [sha])
+            .context("Failed to delete commit audit")?;
+        Ok(n > 0)
+    }
+
+    /// Re-key an audit from `old_sha` to `new_sha` after a commit rewrite.
+    /// Removes any stale row already at `new_sha` first. No-op if `old_sha` absent.
+    pub fn rekey_commit_audit(&self, old_sha: &str, new_sha: &str) -> Result<bool> {
+        self.conn
+            .execute("DELETE FROM commit_audits WHERE id = ?1", [new_sha])
+            .context("Failed to clear target audit before rekey")?;
+        let n = self
+            .conn
+            .execute(
+                "UPDATE commit_audits SET id = ?1 WHERE id = ?2",
+                [new_sha, old_sha],
+            )
+            .context("Failed to rekey commit audit")?;
+        Ok(n > 0)
+    }
+
     pub fn upsert_commit_audit(&self, item: &crate::cognitive_debt::CommitAudit) -> Result<()> {
         let commits_json =
             serde_json::to_string(&item.commits).context("Failed to serialize commits")?;

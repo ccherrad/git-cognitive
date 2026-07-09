@@ -4,7 +4,8 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::cognitive_debt::{
-    detect_ai_attribution, now_rfc3339, timestamp_to_rfc3339, CommitAudit, DebtStore, FileHotspot,
+    detect_ai_attribution, is_reachable, now_rfc3339, timestamp_to_rfc3339, CommitAudit, DebtStore,
+    FileHotspot,
 };
 use crate::db::Database;
 use crate::session::{attribute_commit, Attribution};
@@ -31,12 +32,13 @@ pub fn run_sync(repo_path: &Path) -> Result<()> {
     println!("Found {} merge commit(s) to sync.", merge_commits.len());
 
     let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
+    let agents = crate::agent::enabled(repo_path);
     let mut synced = 0usize;
 
     for sha in &merge_commits {
         match fetch_commit(repo_path, sha) {
             Ok(commit) => {
-                match build_commit_audit(repo_path, &commit) {
+                match build_commit_audit(repo_path, &commit, &agents) {
                     Ok((audit, session_slice)) => {
                         store.write_audit(&audit)?;
                         store.write_session(&commit.sha, &session_slice)?;
@@ -58,6 +60,78 @@ pub fn run_sync(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Handle a git `post-rewrite` hook: migrate audits from rewritten commits to
+/// their new SHAs, preserving each stored score/attribution. Reads `old new`
+/// pairs (whitespace-separated) from stdin, one per line.
+pub fn run_post_rewrite(repo_path: &Path) -> Result<()> {
+    use std::io::Read;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("Failed to read post-rewrite pairs from stdin")?;
+
+    let pairs: Vec<(String, String)> = input
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some(old), Some(new)) if old != new => Some((old.to_string(), new.to_string())),
+                _ => None,
+            }
+        })
+        .collect();
+
+    if pairs.is_empty() {
+        return Ok(());
+    }
+
+    let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
+    let db = Database::init().context("Failed to initialize database")?;
+    let mut migrated = 0usize;
+
+    for (old, new) in &pairs {
+        let store_moved = store.migrate_audit(old, new)?;
+        let db_moved = db.rekey_commit_audit(old, new)?;
+        if store_moved || db_moved {
+            migrated += 1;
+        }
+    }
+
+    store.commit()?;
+
+    if migrated > 0 {
+        println!("Migrated {} audit(s) to rewritten commits.", migrated);
+    }
+    Ok(())
+}
+
+/// Prune audits for commits no longer reachable from any local branch (e.g.
+/// after a rebase or squash-merge dropped their original SHAs).
+pub fn run_gc(repo_path: &Path) -> Result<()> {
+    let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
+    let db = Database::init().context("Failed to initialize database")?;
+
+    let mut pruned = 0usize;
+    for sha in store.stored_shas() {
+        if is_reachable(repo_path, &sha) {
+            continue;
+        }
+        store.delete_audit(&sha);
+        db.delete_commit_audit(&sha)?;
+        pruned += 1;
+    }
+
+    store.commit()?;
+
+    if pruned > 0 {
+        println!("Pruned {} orphaned audit(s).", pruned);
+    } else {
+        println!("No orphaned audits — cognitive/v1 is clean.");
+    }
+    Ok(())
+}
+
 pub fn run_index(repo_path: &Path, output_json: Option<std::path::PathBuf>) -> Result<()> {
     let commits = if output_json.is_some() {
         fetch_all_commits(repo_path)?
@@ -72,11 +146,12 @@ pub fn run_index(repo_path: &Path, output_json: Option<std::path::PathBuf>) -> R
     }
 
     let store = DebtStore::open(repo_path).context("Failed to open debt store")?;
+    let agents = crate::agent::enabled(repo_path);
     let mut audited = 0usize;
     let mut audits = Vec::new();
 
     for commit in &commits {
-        let (item, session_slice) = build_commit_audit(repo_path, commit)?;
+        let (item, session_slice) = build_commit_audit(repo_path, commit, &agents)?;
         store.write_audit(&item)?;
         store.write_session(&commit.sha, &session_slice)?;
 
@@ -202,7 +277,11 @@ fn fetch_covering_commits(repo_path: &Path, db: &Database) -> Result<Vec<CommitI
     Ok(commits)
 }
 
-fn build_commit_audit(repo_path: &Path, commit: &CommitInfo) -> Result<(CommitAudit, Vec<String>)> {
+fn build_commit_audit(
+    repo_path: &Path,
+    commit: &CommitInfo,
+    agents: &[Box<dyn crate::agent::Agent>],
+) -> Result<(CommitAudit, Vec<String>)> {
     let Attribution {
         ai_attributed,
         attribution_pct,
@@ -213,6 +292,7 @@ fn build_commit_audit(repo_path: &Path, commit: &CommitInfo) -> Result<(CommitAu
         &commit.sha,
         commit.timestamp,
         commit.prev_timestamp,
+        agents,
     );
 
     // Fall back to keyword heuristic if session found nothing.

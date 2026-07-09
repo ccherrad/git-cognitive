@@ -48,6 +48,48 @@ fn shard_path(id: &str) -> String {
     format!("{}/{}/{}", a, b, rest)
 }
 
+/// Recursively collect the `id` of every `activity.json` under `root`.
+/// Reads the full SHA from the file rather than the shard path, which is lossy.
+fn collect_audit_shas(root: &Path, out: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                continue;
+            }
+            collect_audit_shas(&path, out);
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("activity.json") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(item) = serde_json::from_slice::<CommitAudit>(&bytes) {
+                    out.push(item.id);
+                }
+            }
+        }
+    }
+}
+
+/// True if `sha` is reachable from any local branch (i.e. still part of real
+/// history). Used to identify orphaned audits after rebase/squash.
+///
+/// `git branch --contains` lists local branches whose tip has `sha` as an
+/// ancestor; a non-empty result means the commit still lives in real history.
+pub fn is_reachable(repo_path: &Path, sha: &str) -> bool {
+    let out = Command::new("git")
+        .current_dir(repo_path)
+        .args(["branch", "--contains", sha])
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        // A missing/unknown SHA errors out — treat as unreachable (orphan).
+        _ => false,
+    }
+}
+
 pub fn read_commit_audit_from_branch(repo_path: &Path, sha: &str) -> Result<Option<CommitAudit>> {
     let shard = shard_path(sha);
     let git_path = format!("cognitive/v1:{}/activity.json", shard);
@@ -176,30 +218,35 @@ impl DebtStore {
 
         let worktree_path = repo_path.join(".git").join("debt-worktree");
 
-        if worktree_path.exists() {
-            Command::new("git")
-                .current_dir(repo_path)
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree_path.to_str().unwrap(),
-                ])
-                .output()
-                .ok();
-            std::fs::remove_dir_all(&worktree_path).ok();
-            Command::new("git")
-                .current_dir(repo_path)
-                .args(["worktree", "prune"])
-                .output()
-                .ok();
-        }
+        // Clear any leftover worktree from a prior run. This must run even when
+        // the directory is gone: a crashed run can leave the worktree *registered*
+        // but with its directory deleted, and `git worktree add` then fails with
+        // "missing but already registered worktree". `remove --force` clears a
+        // present worktree, `prune` clears a stale (missing-dir) registration.
+        Command::new("git")
+            .current_dir(repo_path)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path.to_str().unwrap(),
+            ])
+            .output()
+            .ok();
+        std::fs::remove_dir_all(&worktree_path).ok();
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["worktree", "prune"])
+            .output()
+            .ok();
 
+        // `-f` is a final safety net if a registration still lingers after prune.
         let out = Command::new("git")
             .current_dir(repo_path)
             .args([
                 "worktree",
                 "add",
+                "-f",
                 "--no-checkout",
                 worktree_path.to_str().unwrap(),
                 DEBT_BRANCH,
@@ -254,6 +301,56 @@ impl DebtStore {
             .context("Failed to write session.jsonl")?;
 
         Ok(())
+    }
+
+    /// Re-key an audit and its session slice from `old_sha` to `new_sha`,
+    /// preserving the stored score/attribution. Used after a rebase/amend
+    /// rewrites a commit. No-op if `old_sha` has no stored audit.
+    pub fn migrate_audit(&self, old_sha: &str, new_sha: &str) -> Result<bool> {
+        let old_dir = self.worktree_path.join(shard_path(old_sha));
+        let activity_path = old_dir.join("activity.json");
+        if !activity_path.exists() {
+            return Ok(false);
+        }
+
+        let mut item: CommitAudit = serde_json::from_slice(&std::fs::read(&activity_path)?)
+            .context("Failed to parse activity.json for migration")?;
+        item.id = new_sha.to_string();
+
+        let session = old_dir.join("session.jsonl");
+        let session_content = std::fs::read(&session).ok();
+
+        self.write_audit(&item)?;
+        if let Some(content) = session_content {
+            let new_dir = self.worktree_path.join(shard_path(new_sha));
+            std::fs::create_dir_all(&new_dir)?;
+            std::fs::write(new_dir.join("session.jsonl"), content)?;
+        }
+
+        self.remove_shard(&old_dir);
+        Ok(true)
+    }
+
+    /// Delete a stored audit (and session slice). No-op if absent.
+    pub fn delete_audit(&self, sha: &str) -> bool {
+        let dir = self.worktree_path.join(shard_path(sha));
+        if dir.join("activity.json").exists() {
+            self.remove_shard(&dir);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Every commit SHA that currently has a stored audit.
+    pub fn stored_shas(&self) -> Vec<String> {
+        let mut shas = Vec::new();
+        collect_audit_shas(&self.worktree_path, &mut shas);
+        shas
+    }
+
+    fn remove_shard(&self, dir: &Path) {
+        std::fs::remove_dir_all(dir).ok();
     }
 
     pub fn commit(self) -> Result<()> {
